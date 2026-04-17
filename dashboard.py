@@ -9,6 +9,104 @@ import pandas as pd
 import streamlit as st
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+from ingest_xlsx import classify_ship_raw, infer_settlement_ship_series
+
+
+def _note_icons(note_text: str) -> str:
+    """Derive quick icons from attention-note text."""
+    t = (note_text or "").strip()
+    if not t:
+        return ""
+
+    icons: list[str] = []
+    # Cancellation / cancel request
+    if any(k in t for k in ["취소", "취소요청", "취소 요청", "주문취소", "주문 취소"]):
+        icons.append("⛔")
+    # Product change (not necessarily color-only)
+    if "제품변경" in t or "제품 변경" in t:
+        icons.append("🔄")
+    # Color change only (색상/컬러 변경)
+    if any(k in t for k in ["색상변경", "색상 변경", "컬러변경", "컬러 변경", "색깔변경", "색깔 변경"]):
+        icons.append("🔄")
+    # Addition
+    if any(k in t for k in ["추가", "추가됨", "추가했습니다"]):
+        icons.append("➕")
+    # Color designation (pin)
+    # Common vendor phrasing: "컬러지정", "색상지정"
+    if ("컬러지정" in t) or ("색상지정" in t) or ("색깔지정" in t):
+        icons.append("📌")
+    elif any(k in t for k in ["컬러", "색상", "색깔"]) and ("지정" in t) and ("변경" not in t):
+        icons.append("📌")
+
+    # Remove duplicates while preserving order
+    out: list[str] = []
+    for ic in icons:
+        if ic not in out:
+            out.append(ic)
+    return " ".join(out) if out else ""
+
+
+def _status_lead_icon(status: str) -> str:
+    """Exactly one status emoji before the name (empty for 접수/기타)."""
+    s = (status or "").strip()
+    if s == "출고":
+        return "🚚 "
+    if s == "클레임":
+        return "⚠️ "
+    if s == "마감":
+        return "🧾 "
+    if s == "납품취소":
+        return "⛔ "
+    return ""
+
+
+def _truncate_display_name(name: str, max_chars: int = 8) -> str:
+    n = (name or "").strip()
+    if len(n) <= max_chars:
+        return n
+    if max_chars < 2:
+        return n[:max_chars]
+    return n[: max_chars - 1] + "…"
+
+
+def _attention_note_str(att_v: object) -> tuple[str, bool]:
+    if att_v is None:
+        return "", False
+    try:
+        if pd.isna(att_v):
+            return "", False
+    except Exception:
+        pass
+    s = str(att_v).strip()
+    return s, bool(s)
+
+
+def _trailing_icon_segment(has_attention: bool, note_text: str, max_icons: int = 3) -> str:
+    """Up to max_icons after the name: 🟥 first if present, then note-derived icons."""
+    seq: list[str] = []
+    if has_attention:
+        seq.append("🟥")
+    for tok in _note_icons(note_text).split():
+        if tok:
+            seq.append(tok)
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in seq:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+        if len(out) >= max_icons:
+            break
+    return (" " + " ".join(out)) if out else ""
+
+
+def _compact_name_display(status: str, receiver_name: str, attention_note_val: object) -> str:
+    att, has_att = _attention_note_str(attention_note_val)
+    lead = _status_lead_icon(status)
+    nick = _truncate_display_name(receiver_name, 8)
+    tail = _trailing_icon_segment(has_att, att, 3)
+    return f"{lead}{nick}{tail}".strip()
+
 
 def _backup_sqlite(db_path: str, backup_dir: str = "backups", keep_days: int = 30) -> str | None:
     """Create a safe SQLite backup file and return its path.
@@ -113,6 +211,19 @@ def _db_ready(db_path: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _migrate_orders_schema(db_path: str) -> None:
+    con = sqlite3.connect(db_path)
+    try:
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(orders)")
+        cols = {row[1] for row in cur.fetchall()}
+        if "shipped_at" not in cols:
+            cur.execute("ALTER TABLE orders ADD COLUMN shipped_at TEXT")
+        con.commit()
+    finally:
+        con.close()
+
+
 def _to_date_series(s: pd.Series) -> pd.Series:
     # created_at is ISO string; coerce anything else safely
     return pd.to_datetime(s, errors="coerce").dt.date
@@ -126,10 +237,70 @@ def _today_shipped_excel_cached(export_version: str, shipped_key: str, orders_al
     return _build_shipped_excel_bytes(orders_all, items_all, shipped_date=shipped_date)
 
 
-def _items_view(items: pd.DataFrame, order_id: str) -> pd.DataFrame:
-    df = items[items["order_id"].astype(str) == str(order_id)].copy() if "order_id" in items.columns else pd.DataFrame()
-    if len(df) == 0:
-        return df
+def _excel_line_pick_bucket(raw: object) -> str:
+    """엑셀 품목 배송란 기준으로 피킹 시트(택배/직접) 분류. 미기재·판별불가는 택배 쪽에 둡니다."""
+    if classify_ship_raw(raw) == "직접배송":
+        return "직접배송"
+    return "택배"
+
+
+def _ship_display_label(canonical: str) -> str:
+    """엑셀과 동일하게 표기: 직접배송 → 직접."""
+    c = (canonical or "").strip()
+    if c == "직접배송":
+        return "직접"
+    if c == "택배":
+        return "택배"
+    return c or "택배"
+
+
+def _excel_pick_bucket_series(base: pd.DataFrame) -> pd.Series:
+    """주문 단위 품목 행마다 택배/직접배송 버킷. 배송란 비어 있으면 같은 주문 위쪽 행 값(ffill)."""
+    if "ship_raw" not in base.columns:
+        return pd.Series(_excel_line_pick_bucket(None), index=base.index, dtype=object)
+    work = base.copy()
+    if "row_idx" in work.columns:
+        work = work.sort_values("row_idx")
+
+    def _is_blank(v: object) -> bool:
+        if v is None:
+            return True
+        try:
+            if pd.isna(v):
+                return True
+        except Exception:
+            pass
+        return isinstance(v, str) and not str(v).strip()
+
+    sr = work["ship_raw"].astype(object)
+    filled = sr.mask(sr.map(_is_blank), pd.NA).ffill()
+    work["_pick_bucket"] = filled.map(_excel_line_pick_bucket)
+    return work.loc[base.index, "_pick_bucket"]
+
+
+def _excel_ship_for_picking_row(order_id: object, items_df: pd.DataFrame, pick_kind: str) -> str:
+    """피킹 시트에 실린 품목 줄만으로 다수결(주문 전체 요약이 아님)."""
+    oid = str(order_id or "").strip()
+    if not oid or "order_id" not in items_df.columns or "ship_raw" not in items_df.columns:
+        return _ship_display_label(pick_kind)
+    base = items_df[items_df["order_id"].astype(str) == oid].copy()
+    if len(base) == 0:
+        return "택배"
+    buckets = _excel_pick_bucket_series(base)
+    sub = base.loc[buckets == pick_kind]
+    if len(sub) == 0:
+        return _ship_display_label(pick_kind)
+    ser = infer_settlement_ship_series(sub)
+    lab = str(ser.iloc[0]) if len(ser) else pick_kind
+    return _ship_display_label(lab)
+
+
+def _items_view_from_item_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """이미 주문 1건 분의 품목 행만 담은 데이터프레임 → 표시용 뷰."""
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    df = df.copy()
 
     def _name(r: pd.Series) -> str:
         v = r.get("product_canonical")
@@ -190,6 +361,50 @@ def _items_view(items: pd.DataFrame, order_id: str) -> pd.DataFrame:
     return view
 
 
+def _items_view(items: pd.DataFrame, order_id: str) -> pd.DataFrame:
+    base = items[items["order_id"].astype(str) == str(order_id)].copy() if "order_id" in items.columns else pd.DataFrame()
+    return _items_view_from_item_rows(base)
+
+
+def _items_view_excel_pick_kind(items: pd.DataFrame, order_id: str, pick_kind: str) -> pd.DataFrame:
+    """엑셀 ship_raw 기준으로 해당 피킹(택배/직접)에 올릴 품목 줄만 보이게 필터."""
+    base = items[items["order_id"].astype(str) == str(order_id)].copy() if "order_id" in items.columns else pd.DataFrame()
+    if len(base) == 0:
+        return base
+    if "ship_raw" not in base.columns:
+        return _items_view_from_item_rows(base) if pick_kind == "택배" else pd.DataFrame()
+    b = _excel_pick_bucket_series(base)
+    sub = base.loc[b == pick_kind].copy()
+    return _items_view_from_item_rows(sub)
+
+
+def _order_picking_sheet_hits(items: pd.DataFrame, order_id: object) -> tuple[bool, bool]:
+    """(피킹리스트_택배에 실릴 품목 줄 있음, 피킹리스트_직접에 실릴 품목 줄 있음)."""
+    oid = str(order_id or "").strip()
+    if not oid:
+        return False, False
+    ta = _items_view_excel_pick_kind(items, oid, "택배")
+    dr = _items_view_excel_pick_kind(items, oid, "직접배송")
+    return len(ta) > 0, len(dr) > 0
+
+
+def _picking_stats(shipped: pd.DataFrame, items_all: pd.DataFrame) -> tuple[int, int, int, int]:
+    """(출고 주문 수, 피킹_택배 행 수, 피킹_직접 행 수, 혼합 배송 주문 수). 혼합은 두 피킹 시트에 각 1행."""
+    n_u = len(shipped)
+    if not n_u:
+        return 0, 0, 0, 0
+    n_t = n_d = n_m = 0
+    for _, o in shipped.iterrows():
+        ht, hd = _order_picking_sheet_hits(items_all, o.get("order_id"))
+        if ht:
+            n_t += 1
+        if hd:
+            n_d += 1
+        if ht and hd:
+            n_m += 1
+    return n_u, n_t, n_d, n_m
+
+
 def _items_text(items: pd.DataFrame, order_id: str) -> str:
     view = _items_view(items, order_id)
     if view is None or len(view) == 0:
@@ -224,6 +439,7 @@ def _render_order_detail(container: st.delta_generator.DeltaGenerator, order_row
     phone = str(order_row.get("phone") or "").strip()
     address = str(order_row.get("address") or "").strip()
     req = str(order_row.get("delivery_request") or "").strip()
+    att = str(order_row.get("attention_note") or "").strip()
     status = str(order_row.get("status") or "").strip()
     oid = str(order_row.get("order_id") or "").strip()
 
@@ -264,6 +480,8 @@ def _render_order_detail(container: st.delta_generator.DeltaGenerator, order_row
         header_lines.append(f"- **주소**: {address}")
     if req:
         header_lines.append(f"- **배송요청**: {req}")
+    if att:
+        header_lines.append(f"- **특이사항(자동)**: {att}")
     if oid:
         header_lines.append(f"- **ID**: `{oid}`")
 
@@ -300,11 +518,12 @@ def _render_order_detail(container: st.delta_generator.DeltaGenerator, order_row
             "책장색상": _sv("책장색상"),
             "다리색상": _sv("다리색상"),
             "개수": _sv("개수"),
+            "배송": _sv("배송"),
         }
         title = parts["품목"] or "(품목명 없음)"
         container.markdown(f"**{i}. {title}**")
 
-        # Compact line: 규격+사이즈+책장색상+다리색상+개수 (skip empty)
+        # Compact line: 규격+사이즈+책장색상+다리색상+개수+배송 (skip empty)
         compact_parts = []
         if parts.get("규격/옵션"):
             compact_parts.append(parts["규격/옵션"])
@@ -316,10 +535,113 @@ def _render_order_detail(container: st.delta_generator.DeltaGenerator, order_row
             compact_parts.append(f"다리:{parts['다리색상']}")
         if parts.get("개수"):
             compact_parts.append(f"개수:{parts['개수']}")
+        if parts.get("배송"):
+            compact_parts.append(f"배송:{parts['배송']}")
         if compact_parts:
             container.markdown(" / ".join(compact_parts))
         if i != len(view):
             container.markdown("---")
+
+
+def _format_picking_worksheet(ws: object) -> None:
+    """피킹리스트 시트 공통 인쇄 서식 (택배/직접 동일)."""
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.print_title_rows = "1:1"
+    ws.page_margins.left = 0.25
+    ws.page_margins.right = 0.25
+    ws.page_margins.top = 0.35
+    ws.page_margins.bottom = 0.35
+    ws.page_margins.header = 0.2
+    ws.page_margins.footer = 0.2
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    header_fill = PatternFill("solid", fgColor="E3F2FD")
+    header_font = Font(bold=True)
+    thin_side = Side(style="thin", color="B0B0B0")
+    header_side = Side(style="medium", color="607D8B")
+    thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    header_border = Border(left=header_side, right=header_side, top=header_side, bottom=header_side)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = header_border
+
+    wrap_cols = {"주소", "배송요청", "특이사항", "품목"}
+    header_map = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
+    for name, col_idx in header_map.items():
+        if name == "No":
+            ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 5
+        elif name in ("받는분",):
+            ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 12
+        elif name == "배송(엑셀)":
+            ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 11
+        elif name in ("전화",):
+            ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 14
+        elif name == "주소":
+            ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 40
+        elif name == "배송요청":
+            ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 24
+        elif name == "특이사항":
+            ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 18
+        elif name == "품목":
+            ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 52
+
+    item_col_idx = header_map.get("품목")
+    item_col_width = 52
+    chars_per_line = max(10, int(item_col_width * 1.1))
+    base_line_height = 15
+
+    for r in range(2, ws.max_row + 1):
+        ws.row_dimensions[r].height = 24
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            header = ws.cell(1, c).value
+            if header in wrap_cols:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+            else:
+                cell.alignment = Alignment(vertical="top")
+            if r % 2 == 0:
+                cell.fill = PatternFill("solid", fgColor="FAFAFA")
+            cell.border = thin_border
+
+        if item_col_idx:
+            v = ws.cell(r, item_col_idx).value
+            text = "" if v is None else str(v)
+            raw_lines = text.splitlines() if text else [""]
+            line_count = 0
+            for ln in raw_lines:
+                ln_len = len(ln)
+                line_count += max(1, (ln_len + chars_per_line - 1) // chars_per_line)
+            ws.row_dimensions[r].height = max(24, min(300, base_line_height * line_count + 12))
+
+
+def _format_pick_summary_sheet(ws: object) -> None:
+    """출고_피킹요약 시트 가독성."""
+    header_fill = PatternFill("solid", fgColor="E3F2FD")
+    header_font = Font(bold=True)
+    thin_side = Side(style="thin", color="B0B0B0")
+    thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    header_side = Side(style="medium", color="607D8B")
+    header_border = Border(left=header_side, right=header_side, top=header_side, bottom=header_side)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = header_border
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 72
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            cell.border = thin_border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        ws.row_dimensions[r].height = max(18, min(120, 14 * (1 + str(ws.cell(r, 2).value or "").count("\n"))))
 
 
 def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame, shipped_date: dt.date) -> bytes:
@@ -364,42 +686,87 @@ def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame
                 parts.append(f"다리:{leg}")
             if qty:
                 parts.append(f"개수:{qty}")
+            ship = _sv(r.get("배송"))
+            if ship:
+                parts.append(f"배송:{ship}")
             line = f"{i}. {name}"
             if parts:
                 line += " — " + " / ".join(parts)
             lines.append(line)
         return "\n".join(lines)
 
-    pick_rows: list[dict[str, object]] = []
-    for idx, o in shipped.iterrows():
-        oid = o.get("order_id")
-        view = _items_view(items_all, oid) if oid is not None else pd.DataFrame()
-        pick_rows.append(
-            {
-                "No": idx + 1,
-                "받는분": o.get("receiver_name"),
-                "전화": o.get("phone"),
-                "주소": o.get("address"),
-                "배송요청": o.get("delivery_request"),
-                "특이사항": o.get("special_issue"),
-                "품목": _item_line_from_view(view) if len(view) else (o.get("order_list") or ""),
-            }
-        )
-    picking_sheet = pd.DataFrame(pick_rows)
+    def _picking_rows_for_kind(pick_kind: str) -> pd.DataFrame:
+        rows: list[dict[str, object]] = []
+        n = 0
+        for _, o in shipped.iterrows():
+            oid = o.get("order_id")
+            view = _items_view_excel_pick_kind(items_all, str(oid), pick_kind) if oid is not None else pd.DataFrame()
+            if len(view) == 0:
+                continue
+            n += 1
+            rows.append(
+                {
+                    "No": n,
+                    "받는분": o.get("receiver_name"),
+                    "배송(엑셀)": _excel_ship_for_picking_row(oid, items_all, pick_kind),
+                    "전화": o.get("phone"),
+                    "주소": o.get("address"),
+                    "배송요청": o.get("delivery_request"),
+                    "특이사항": o.get("special_issue"),
+                    "품목": _item_line_from_view(view),
+                }
+            )
+        cols = ["No", "받는분", "배송(엑셀)", "전화", "주소", "배송요청", "특이사항", "품목"]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
-    # 로젠택배 서식 (오늘 출고 주문 1행=1송장)
-    def _lozen_item_name(o: pd.Series) -> str:
-        # Prefer first item name; fallback to order_list
+    picking_taek = _picking_rows_for_kind("택배")
+    picking_direct = _picking_rows_for_kind("직접배송")
+
+    n_u, n_t_rows, n_d_rows, n_m = _picking_stats(shipped, items_all)
+    mixed_labels: list[str] = []
+    for _, o in shipped.iterrows():
+        ht, hd = _order_picking_sheet_hits(items_all, o.get("order_id"))
+        if ht and hd:
+            rn = str(o.get("receiver_name") or "").strip()
+            mixed_labels.append(rn or str(o.get("order_id") or ""))
+    mixed_text = ", ".join(mixed_labels) if mixed_labels else "—"
+
+    summary_df = pd.DataFrame(
+        [
+            {"항목": "출고 기준일", "값": shipped_date.isoformat()},
+            {"항목": "출고 주문 수(주문그룹)", "값": n_u},
+            {"항목": "피킹리스트_택배 행 수", "값": n_t_rows},
+            {"항목": "피킹리스트_직접 행 수", "값": n_d_rows},
+            {"항목": "혼합 배송 주문 수", "값": n_m},
+            {
+                "항목": "검산",
+                "값": f"택배 {n_t_rows}행 + 직접 {n_d_rows}행 = 출고 {n_u}건 + 혼합 {n_m}건",
+            },
+            {"항목": "혼합 주문(받는분)", "값": mixed_text},
+            {
+                "항목": "안내",
+                "값": "품목 배송란에 직접·택배가 함께 있는 주문은 두 피킹 시트에 각 한 줄씩 들어갑니다. 행 수 합은 출고 건수와 다를 수 있습니다.",
+            },
+        ]
+    )
+
+    # 로젠택배 서식: 택배로 나가는 주문만 (직접배송 전용 주문 제외)
+    def _lozen_item_name_taek(o: pd.Series) -> str:
         oid = o.get("order_id")
-        view = _items_view(items_all, oid) if oid is not None else pd.DataFrame()
+        view = _items_view_excel_pick_kind(items_all, str(oid), "택배") if oid is not None else pd.DataFrame()
         if len(view) and "품목" in view.columns:
             first = str(view.iloc[0]["품목"]).strip()
-            return first or str(o.get("order_list") or "").splitlines()[0:1][0] if str(o.get("order_list") or "").strip() else ""
+            if first:
+                return first
         ol = str(o.get("order_list") or "").strip().replace("\n", " / ")
         return (ol[:50] + "…") if len(ol) > 51 else ol
 
     lozen_rows: list[dict[str, object]] = []
     for _, o in shipped.iterrows():
+        oid = o.get("order_id")
+        ht, _hd = _order_picking_sheet_hits(items_all, oid)
+        if not ht:
+            continue
         lozen_rows.append(
             {
                 "수하인명": o.get("receiver_name"),
@@ -409,11 +776,28 @@ def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame
                 "박스수량": 1,
                 "택배운임": 3000,
                 "운임구분": "선불",
-                "품목명": _lozen_item_name(o),
+                "품목명": _lozen_item_name_taek(o),
                 "배송메세지": o.get("delivery_request"),
             }
         )
-    lozen_sheet = pd.DataFrame(lozen_rows)
+    lozen_cols = [
+        "수하인명",
+        "수하인주소",
+        "수하인전화번호",
+        "수하인휴대폰번호",
+        "박스수량",
+        "택배운임",
+        "운임구분",
+        "품목명",
+        "배송메세지",
+    ]
+    lozen_sheet = pd.DataFrame(lozen_rows, columns=lozen_cols) if lozen_rows else pd.DataFrame(columns=lozen_cols)
+
+    if "order_id" in shipped.columns and len(items_all) and "order_id" in items_all.columns:
+        _sm = infer_settlement_ship_series(items_all)
+        shipped = shipped.copy()
+        shipped["배송(엑셀)"] = shipped["order_id"].astype(str).map(_sm).fillna("택배")
+        shipped["배송(엑셀)"] = shipped["배송(엑셀)"].map(_ship_display_label)
 
     # Order sheet (one row per order)
     order_cols = [
@@ -424,6 +808,7 @@ def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame
         "delivery_request",
         "order_list",
         "special_issue",
+        "배송(엑셀)",
         "status",
         "shipped_at",
         "order_id",
@@ -475,15 +860,20 @@ def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame
 
         item_sheet["_품목"] = item_sheet.apply(_item_key, axis=1)
         item_sheet["_수량"] = pd.to_numeric(item_sheet.get("qty"), errors="coerce").fillna(0).astype(int)
+
+        def _ship_join(s: pd.Series) -> str:
+            vals = sorted({str(x).strip() for x in s.dropna().tolist() if str(x).strip()})
+            return " / ".join(vals) if vals else ""
+
         item_sheet = (
-            item_sheet.groupby("_품목", as_index=False)["_수량"]
-            .sum()
+            item_sheet.groupby("_품목", as_index=False)
+            .agg(_수량=("_수량", "sum"), 엑셀배송=("ship_raw", _ship_join))
             .rename(columns={"_품목": "품목", "_수량": "수량"})
             .sort_values(["품목"])
             .reset_index(drop=True)
         )
     else:
-        item_sheet = pd.DataFrame(columns=["품목", "수량"])
+        item_sheet = pd.DataFrame(columns=["품목", "수량", "엑셀배송"])
 
     # Friendly column names
     order_sheet = order_sheet.rename(
@@ -510,92 +900,23 @@ def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        picking_sheet.to_excel(writer, index=False, sheet_name="피킹리스트")
+        summary_df.to_excel(writer, index=False, sheet_name="출고_피킹요약")
+        picking_taek.to_excel(writer, index=False, sheet_name="피킹리스트_택배")
+        picking_direct.to_excel(writer, index=False, sheet_name="피킹리스트_직접")
         lozen_sheet.to_excel(writer, index=False, sheet_name="로젠택배")
         order_sheet.to_excel(writer, index=False, sheet_name="출고_주문")
         item_sheet.to_excel(writer, index=False, sheet_name="출고_품목")
 
-        # Basic formatting for picking list
-        ws = writer.book["피킹리스트"]
-        # Print setup: A4 landscape, fit to page width
-        ws.page_setup.orientation = "landscape"
-        ws.page_setup.paperSize = ws.PAPERSIZE_A4
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
-        ws.print_title_rows = "1:1"
-        ws.page_margins.left = 0.25
-        ws.page_margins.right = 0.25
-        ws.page_margins.top = 0.35
-        ws.page_margins.bottom = 0.35
-        ws.page_margins.header = 0.2
-        ws.page_margins.footer = 0.2
-        ws.sheet_properties.pageSetUpPr.fitToPage = True
-
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
         header_fill = PatternFill("solid", fgColor="E3F2FD")
         header_font = Font(bold=True)
         thin_side = Side(style="thin", color="B0B0B0")
-        header_side = Side(style="medium", color="607D8B")
         thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+        header_side = Side(style="medium", color="607D8B")
         header_border = Border(left=header_side, right=header_side, top=header_side, bottom=header_side)
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = header_border
 
-        wrap_cols = {"주소", "배송요청", "특이사항", "품목"}
-        header_map = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-        for name, col_idx in header_map.items():
-            # column widths
-            if name == "No":
-                ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 5
-            elif name in ("받는분",):
-                ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 12
-            elif name in ("전화",):
-                ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 14
-            elif name == "주소":
-                ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 40
-            elif name == "배송요청":
-                ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 24
-            elif name == "특이사항":
-                ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 18
-            elif name == "품목":
-                ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = 52
-
-        # Auto-fit-like row height for "품목" only (so full text is visible when opened/printed)
-        item_col_idx = header_map.get("품목")
-        item_col_width = 52  # must match column width above
-        chars_per_line = max(10, int(item_col_width * 1.1))
-        base_line_height = 15  # points
-
-        for r in range(2, ws.max_row + 1):
-            # default compact height; we'll expand only if 품목 needs it
-            ws.row_dimensions[r].height = 24
-            for c in range(1, ws.max_column + 1):
-                cell = ws.cell(r, c)
-                header = ws.cell(1, c).value
-                if header in wrap_cols:
-                    cell.alignment = Alignment(vertical="top", wrap_text=True)
-                else:
-                    cell.alignment = Alignment(vertical="top")
-                # subtle zebra striping for print readability
-                if r % 2 == 0:
-                    cell.fill = PatternFill("solid", fgColor="FAFAFA")
-                cell.border = thin_border
-
-            if item_col_idx:
-                v = ws.cell(r, item_col_idx).value
-                text = "" if v is None else str(v)
-                # estimate wrapped line count
-                raw_lines = text.splitlines() if text else [""]
-                line_count = 0
-                for ln in raw_lines:
-                    ln_len = len(ln)
-                    line_count += max(1, (ln_len + chars_per_line - 1) // chars_per_line)
-                # add a bit of padding
-                ws.row_dimensions[r].height = max(24, min(300, base_line_height * line_count + 12))
+        _format_pick_summary_sheet(writer.book["출고_피킹요약"])
+        _format_picking_worksheet(writer.book["피킹리스트_택배"])
+        _format_picking_worksheet(writer.book["피킹리스트_직접"])
 
         # Formatting for 로젠택배 sheet (A4 landscape + grid)
         ws_l = writer.book["로젠택배"]
@@ -674,14 +995,16 @@ def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame
             cell.border = header_border
 
         # Column widths + wrap for long text
-        wrap_cols2 = {"품목"}
+        wrap_cols2 = {"품목", "엑셀배송"}
         header_map2 = {ws2.cell(1, c).value: c for c in range(1, ws2.max_column + 1)}
         for name, col_idx in header_map2.items():
             letter = ws2.cell(1, col_idx).column_letter
             if name == "품목":
-                ws2.column_dimensions[letter].width = 78
+                ws2.column_dimensions[letter].width = 70
             elif name == "수량":
                 ws2.column_dimensions[letter].width = 8
+            elif name == "엑셀배송":
+                ws2.column_dimensions[letter].width = 18
 
         for r in range(2, ws2.max_row + 1):
             ws2.row_dimensions[r].height = 28
@@ -801,23 +1124,36 @@ def main() -> None:
         )
         st.stop()
 
+    _migrate_orders_schema(db_path)
     _mt, _sz = _db_stat_for_cache(db_path)
     orders_all, items_all = load_tables(db_path, _mt, _sz)
 
-    # Ensure shipped_at column exists (older DBs)
-    con = sqlite3.connect(db_path)
     try:
-        cur = con.cursor()
-        cur.execute("PRAGMA table_info(orders)")
-        cols = {row[1] for row in cur.fetchall()}
-        if "shipped_at" not in cols:
-            cur.execute("ALTER TABLE orders ADD COLUMN shipped_at TEXT")
-            con.commit()
-    finally:
-        con.close()
+        con0 = sqlite3.connect(db_path)
+        try:
+            recent_files = pd.read_sql_query(
+                """
+                select
+                  source_file as 파일,
+                  count(*) as 주문건수,
+                  max(created_at) as 마지막수집
+                from orders
+                group by source_file
+                order by 마지막수집 desc
+                limit 12
+                """,
+                con0,
+            )
+        finally:
+            con0.close()
+        if len(recent_files):
+            st.sidebar.markdown("**최근 수집 파일(최대 12개)**")
+            st.sidebar.dataframe(recent_files, use_container_width=True, hide_index=True)
+    except Exception:
+        pass
 
     with st.sidebar.expander("출고 목록 엑셀", expanded=False):
-        export_version = "v4_lozen_sheet"
+        export_version = "v11_lozen_taek_only"
         shipped_date = st.date_input("출고 기준 날짜", value=dt.date.today(), key="export_shipped_date")
         shipped_today_cnt = 0
         if "status" in orders_all.columns:
@@ -828,6 +1164,13 @@ def main() -> None:
             else:
                 shipped_today_cnt = len(shipped)
         st.caption(f"{shipped_date.isoformat()} 출고: {shipped_today_cnt}건")
+        if shipped_today_cnt > 0 and "status" in orders_all.columns:
+            shipped_pick = orders_all[orders_all["status"] == "출고"].copy()
+            if "shipped_at" in shipped_pick.columns:
+                shipped_pick["_d"] = pd.to_datetime(shipped_pick["shipped_at"], errors="coerce").dt.date
+                shipped_pick = shipped_pick[shipped_pick["_d"] == shipped_date]
+            _nu, _nt, _nd, _nm = _picking_stats(shipped_pick, items_all)
+            st.caption(f"피킹 시트 행: 택배 {_nt}, 직접 {_nd} — 혼합 {_nm}건은 두 시트에 각 1행 (검산 {_nt}+{_nd} = {_nu}+{_nm})")
         filename = f"mutomo_shipped_{shipped_date.isoformat()}_shipped.xlsx"
         shipped_today_ids = []
         if shipped_today_cnt > 0 and "status" in orders_all.columns:
@@ -902,16 +1245,11 @@ def main() -> None:
                 purchase = str(row.get("purchase_date") or "").strip()
                 name = str(row.get("receiver_name") or "").strip()
                 status = str(row.get("status") or "").strip()
-                status_tag = ""
-                if status == "출고":
-                    status_tag = "🚚✅[출고완료] "
-                elif status == "클레임":
-                    status_tag = "⚠️[클레임] "
-                elif status == "접수":
-                    status_tag = "📝⏳[접수] "
+                att_v = row.get("attention_note")
+                name_seg = _compact_name_display(status, name, att_v)
                 order_list = str(row.get("order_list") or "").strip().replace("\n", " / ")
                 order_list = (order_list[:120] + "…") if len(order_list) > 121 else order_list
-                return f"{status_tag}{purchase} | {name} | {order_list}".strip(" |")
+                return f"{purchase} | {name_seg} | {order_list}".strip(" |")
 
             rows = hits.copy()
             rows["_label"] = rows.apply(_label, axis=1)
@@ -1046,15 +1384,33 @@ def main() -> None:
 
     def _day_panel(col, day: dt.date) -> None:
         df = recent_base[recent_base["_date"] == day].copy()
-        df = df[[c for c in ["purchase_date", "receiver_name"] if c in df.columns]]
+        # Show request/attention icons in the "today" panels too
+        keep = [c for c in ["purchase_date", "receiver_name", "attention_note", "status"] if c in df.columns]
+        df = df[keep]
         if "purchase_date" not in df.columns:
             df["purchase_date"] = day.isoformat()
         if "receiver_name" not in df.columns:
             df["receiver_name"] = ""
-        df = df.rename(columns={"purchase_date": "날짜", "receiver_name": "이름"})
-        df = df.sort_values(["이름"], na_position="last")
+        if "attention_note" not in df.columns:
+            df["attention_note"] = ""
+        if "status" not in df.columns:
+            df["status"] = ""
+
+        def _disp_name(r: pd.Series) -> str:
+            nm = "" if r.get("receiver_name") is None else str(r.get("receiver_name")).strip()
+            stt = "" if r.get("status") is None else str(r.get("status")).strip()
+            return _compact_name_display(stt, nm, r.get("attention_note"))
+
+        df["_이름표시"] = df.apply(_disp_name, axis=1)
+        df = df.rename(columns={"purchase_date": "날짜"})
+        df = df[["날짜", "_이름표시"]].rename(columns={"_이름표시": "이름"}).sort_values(["이름"], na_position="last")
         col.markdown(f"**{day.isoformat()}**")
-        col.dataframe(df, use_container_width=True, hide_index=True)
+        col.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={"이름": st.column_config.TextColumn("이름", width="medium")},
+        )
 
     c1, c2, c3, c4 = st.columns(4)
     _day_panel(c1, today)
@@ -1063,13 +1419,20 @@ def main() -> None:
     _day_panel(c4, today - dt.timedelta(days=3))
 
     st.subheader("전체 접수 목록")
+    st.caption(
+        "🟥 표시는 엑셀 A열의 ‘특이사항(자동)’이 있는 주문입니다. "
+        "**배송(엑셀)** 은 목록에서만 보는 품목 배송란 다수결 요약입니다. "
+        "사이드바 상세의 배송은 **품목** 아래 **배송:** 에 적힌 엑셀 원문만 쓰며, 변경은 현장에서 처리합니다."
+    )
     user_cols = [
         "purchase_date",
         "receiver_name",
+        "배송(엑셀)",
         "order_list",
         "address",
         "phone",
         "delivery_request",
+        "attention_note",
         "special_issue",
         "status",
     ]
@@ -1086,6 +1449,12 @@ def main() -> None:
     sorted_orders = orders.drop(columns=["_date"], errors="ignore")
     if sort_cols_all:
         sorted_orders = sorted_orders.sort_values(sort_cols_all, na_position="last")
+    if "order_id" in sorted_orders.columns and len(items_all) and "order_id" in items_all.columns:
+        _ship_map = infer_settlement_ship_series(items_all)
+        sorted_orders = sorted_orders.copy()
+        sorted_orders["배송(엑셀)"] = (
+            sorted_orders["order_id"].astype(str).map(_ship_map).fillna("택배").map(_ship_display_label)
+        )
     view_orders = sorted_orders[[c for c in all_cols if c in sorted_orders.columns]].copy()
 
     # Make status visually distinct (emoji badges). Streamlit's dataframe has limited per-row styling.
@@ -1106,28 +1475,28 @@ def main() -> None:
 
         view_orders["status"] = view_orders["status"].map(_badge)
 
-    # Add status emoji after receiver name for quick scanning
+    # 한 칸: 상태 이모지 1 + 이름(최대 8자) + 뒤 아이콘 최대 3 (status 열은 긴 뱃지 유지).
     if "receiver_name" in view_orders.columns and "status" in sorted_orders.columns:
         def _name_emoji(row) -> str:
             name = "" if row.get("receiver_name") is None else str(row.get("receiver_name")).strip()
             stt = "" if row.get("status") is None else str(row.get("status")).strip()
-            emoji = ""
-            if stt == "출고":
-                emoji = " 🚚✅"
-            elif stt == "클레임":
-                emoji = " ⚠️"
-            elif stt == "마감":
-                emoji = " 🧾"
-            elif stt == "납품취소":
-                emoji = " ⛔"
-            return (name + emoji).strip()
+            return _compact_name_display(stt, name, row.get("attention_note"))
 
         # Use sorted_orders for original status values
-        tmp = sorted_orders.loc[view_orders.index, ["receiver_name", "status"]].copy()
+        cols_tmp = [c for c in ["receiver_name", "status", "attention_note"] if c in sorted_orders.columns]
+        tmp = sorted_orders.loc[view_orders.index, cols_tmp].copy()
         view_orders["receiver_name"] = tmp.apply(_name_emoji, axis=1)
 
     st.caption("행을 선택하면 왼쪽 사이드바에 주문상세가 표시됩니다.")
     selected_ids: list[str] = []
+    name_col_cfg: dict | None = None
+    _cols_cfg: dict = {}
+    if "receiver_name" in view_orders.columns:
+        _cols_cfg["receiver_name"] = st.column_config.TextColumn("이름", width="medium")
+    if "배송(엑셀)" in view_orders.columns:
+        _cols_cfg["배송(엑셀)"] = st.column_config.TextColumn("배송(엑셀)", width="small")
+    if _cols_cfg:
+        name_col_cfg = _cols_cfg
     if "order_id" in sorted_orders.columns:
         try:
             # Streamlit row selection (supported in recent versions)
@@ -1135,6 +1504,7 @@ def main() -> None:
                 view_orders,
                 use_container_width=True,
                 hide_index=True,
+                column_config=name_col_cfg,
                 on_select="rerun",
                 selection_mode="multi-row",
             )
@@ -1144,9 +1514,9 @@ def main() -> None:
                 selected_ids = sorted_orders.iloc[rows]["order_id"].astype(str).tolist()
         except TypeError:
             # Older Streamlit: no selection support, just show the table.
-            st.dataframe(view_orders, use_container_width=True, hide_index=True)
+            st.dataframe(view_orders, use_container_width=True, hide_index=True, column_config=name_col_cfg)
     else:
-        st.dataframe(view_orders, use_container_width=True, hide_index=True)
+        st.dataframe(view_orders, use_container_width=True, hide_index=True, column_config=name_col_cfg)
 
     # Mirror "name search" behavior: show selected rows in sidebar
     # Persist selection so button clicks don't lose it on rerun
@@ -1209,6 +1579,12 @@ def main() -> None:
             st.sidebar.success("저장했습니다.")
             st.cache_data.clear()
             st.rerun()
+
+    else:
+        st.sidebar.caption(
+            "주문을 검색 또는 아래 목록에서 선택하면 **클레임/특이사항** 메모를 저장할 수 있습니다. "
+            "목록의 **배송(엑셀)** 은 스캔용 요약이며, 상세 배송은 품목 줄의 엑셀 원문만 봅니다."
+        )
 
     # Single ship button behavior: if the active selector is table, ship those ids.
     if ship_action and st.session_state.get("active_selector") == "table":

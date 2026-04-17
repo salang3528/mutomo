@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+from collections import Counter
 import os
 import re
 import sqlite3
@@ -54,6 +55,7 @@ class ItemRow:
     address_raw: str | None
     phone_raw: str | None
     delivery_request_raw: str | None
+    attention_note_raw: str | None
 
 
 def purchase_date_from_filename(source_file: str) -> str | None:
@@ -151,6 +153,103 @@ def _parse_excel(path: str) -> list[ItemRow]:
     current_address = None
     current_phone = None
     current_delivery_request = None
+    current_attention_note = None
+
+    # Some order sheets contain an "instruction/note" in column A (e.g. A2/A9)
+    # like: "(3/28 주문 서혜선님 제품변경, 컬러지정하였습니다. ...)"
+    # We capture these and attach them to the matching receiver as an attention note.
+    pending_note_by_name: dict[str, str] = {}
+    pending_unassigned_notes: list[str] = []
+
+    def _extract_name_note(s: str | None) -> tuple[str | None, str | None]:
+        if not s:
+            return None, None
+        s2 = str(s).strip()
+        if not s2:
+            return None, None
+        # Typical keywords that appear in these attention notes.
+        # Helps avoid false positives when scanning a lot of rows.
+        if not re.search(r"(변경|컬러|색상|추가|수정|주소|옵션|취소|반품|교환)", s2):
+            return None, None
+
+        # Many sheets start these lines with a date like "3/28 ..."
+        # Use it as an extra safety signal when order keywords are absent.
+        has_order_kw = bool(re.search(r"(주문|주문자)", s2))
+        has_date_prefix = bool(re.match(r"^\s*\d{1,2}\s*/\s*\d{1,2}", s2))
+        if not has_order_kw and not has_date_prefix:
+            # Allow lines like: "장재국 색상지정 ..." (no date/order keyword)
+            m0 = re.search(r"([가-힣]{2,10}).*(?:색상|컬러|색깔).*(?:지정)", s2)
+            if m0:
+                nm0 = (m0.group(1) or "").strip()
+                return (nm0 or None), s2
+            return None, None
+
+        # Primary: "주문 홍길동님" or "주문 홍길동 ..."
+        m = re.search(r"(?:주문|주문자)\s*([가-힣]{2,10})(?:\s*님)?", s2)
+        if m:
+            name = (m.group(1) or "").strip()
+            if name:
+                return name, s2
+
+        # Fallback: if it contains "님", grab the nearest Hangul name before it.
+        m2 = re.search(r"([가-힣]{2,10})\s*님", s2)
+        if m2:
+            name = (m2.group(1) or "").strip()
+            if name:
+                return name, s2
+
+        # Keep as unassigned note (we may still match by inclusion later)
+        return None, s2
+
+    def _merge_req(existing: str | None, extra: str | None) -> str | None:
+        ex = (existing or "").strip()
+        ex2 = (extra or "").strip()
+        if not ex and not ex2:
+            return None
+        if not ex:
+            return ex2
+        if not ex2:
+            return ex
+        if ex2 in ex:
+            return ex
+        # Keep as a single line for UI scanning
+        return f"{ex} / {ex2}"
+
+    # Scan A-column notes across the sheet (some files put them far below, e.g. A106).
+    # Keep it bounded to avoid pathological sheets.
+    scan_end = min(ws.max_row, header_row + 500)
+    for r in range(header_row + 1, scan_end + 1):
+        note = _to_str(ws.cell(r, 1).value)
+        nm, txt = _extract_name_note(note)
+        if nm and txt:
+            pending_note_by_name[nm] = _merge_req(pending_note_by_name.get(nm), txt) or txt
+        elif txt:
+            # Keep as a fallback: later we can match it by inclusion against receiver_name.
+            pending_unassigned_notes.append(txt)
+
+    def _pick_note_for_receiver(receiver: str | None) -> str | None:
+        if not receiver:
+            return None
+        rn = str(receiver).strip()
+        if not rn:
+            return None
+        # Exact match first
+        if rn in pending_note_by_name:
+            return pending_note_by_name[rn]
+        # Fallback: containment match (handles cases like "서혜선(네이버)" vs "서혜선")
+        for k, v in pending_note_by_name.items():
+            kk = (k or "").strip()
+            if not kk:
+                continue
+            if kk in rn or rn in kk:
+                return v
+        # Final fallback: match unassigned note text that contains the receiver name.
+        rn2 = re.sub(r"\s+", "", rn)
+        for txt in pending_unassigned_notes:
+            t2 = re.sub(r"\s+", "", txt or "")
+            if rn2 and t2 and (rn2 in t2):
+                return txt
+        return None
 
     blank_run = 0
     for r in range(header_row + 1, ws.max_row + 1):
@@ -178,16 +277,50 @@ def _parse_excel(path: str) -> list[ItemRow]:
             delivery_request,
         ) = vals
 
-        # Group header rows typically contain group_no (a number).
+        # Rows where "번호" is a digit: may be a new order block, or the same order with the
+        # number repeated on every line. Only advance group_start_row when the block actually
+        # changes (new 번호, or same 번호 but a new 받는분), so one customer does not split into
+        # multiple order_id values.
         if _looks_like_int(group_no):
+
+            def _norm_group_digits(s: str | None) -> str | None:
+                if not s or not _looks_like_int(s):
+                    return None
+                return str(int(str(s).strip()))
+
+            new_gn = _norm_group_digits(group_no)
+            old_gn = _norm_group_digits(str(current_group_no)) if current_group_no is not None else None
+            recv_cell = _to_str(receiver_name)
+            prev_recv = _to_str(current_receiver_name)
+
+            advance_start = old_gn is None or new_gn != old_gn
+            if not advance_start and recv_cell and prev_recv and recv_cell.strip() != prev_recv.strip():
+                advance_start = True
+            if not advance_start and recv_cell and not prev_recv:
+                advance_start = True
+
+            if advance_start:
+                current_group_start_row = r
+
             current_deadline = deadline or current_deadline
             current_group_no = group_no
-            current_group_start_row = r
             current_receiver_name = receiver_name or current_receiver_name
             current_order_date = order_date or current_order_date
             current_address = address or current_address
             current_phone = phone or current_phone
-            current_delivery_request = delivery_request or current_delivery_request
+            # delivery_request is order-specific; DO NOT carry over from previous groups.
+            if advance_start:
+                current_delivery_request = delivery_request
+            else:
+                dr = _to_str(delivery_request)
+                if dr:
+                    current_delivery_request = delivery_request
+
+            # Attach any pending A-column note that matches this receiver name.
+            current_attention_note = None
+            extra = _pick_note_for_receiver(current_receiver_name)
+            if extra:
+                current_attention_note = extra
 
         # Item rows: product exists OR spec/option exists AND we have an active group.
         is_itemish = bool(product or spec or shelf_color or leg_color) and bool(current_group_no)
@@ -212,6 +345,7 @@ def _parse_excel(path: str) -> list[ItemRow]:
                 address_raw=address or current_address,
                 phone_raw=phone or current_phone,
                 delivery_request_raw=delivery_request or current_delivery_request,
+                attention_note_raw=current_attention_note,
             )
         )
 
@@ -296,6 +430,84 @@ def _to_int(s: str | None) -> int | None:
     return int(s2) if s2 else None
 
 
+# 엑셀 품목 `ship_raw` → 직접/택배 판별(주문 다수결에 사용).
+SETTLEMENT_SHIP_VALUES: tuple[str, ...] = ("직접배송", "택배")
+
+
+def classify_ship_raw(raw: object) -> str | None:
+    """한 줄의 ship_raw를 직접배송/택배로 분류. 알 수 없으면 None."""
+    if raw is None:
+        return None
+    try:
+        if pd.isna(raw):
+            return None
+    except Exception:
+        pass
+    s = _normalize_text(str(raw))
+    if not s:
+        return None
+    # 엑셀에 '직접' / '택배'만 적는 경우(가장 흔함)
+    compact = s.replace(" ", "")
+    if compact in ("직접", "직접."):
+        return "직접배송"
+    if compact in ("택배", "택배."):
+        return "택배"
+    direct_markers = (
+        "직접배송",
+        "직접 배송",
+        "직접배",
+        "직배",
+        "직송",
+        "직배송",
+        "직배차",
+        "방문수령",
+        "방문 수령",
+        "매장수령",
+        "매장 수령",
+        "직거래",
+        "자체배송",
+        "자체 배송",
+        "자체픽업",
+        "고객방문",
+        "방문픽업",
+        "방문 배송",
+        "방문배송",
+        "당사배송",
+        "당사 배송",
+        "지게차",
+        "사다리차",
+    )
+    if any(k in s for k in direct_markers):
+        return "직접배송"
+    if any(k in s for k in ("택배", "로젠", "parcel", "courier")):
+        return "택배"
+    return None
+
+
+def infer_settlement_ship_series(items_df: pd.DataFrame) -> pd.Series:
+    """order_id -> '직접배송' | '택배' from 엑셀 품목 ship_raw (다수결; 동수·미기재는 택배)."""
+    if items_df is None or len(items_df) == 0 or "order_id" not in items_df.columns:
+        return pd.Series(dtype=str)
+    tmp = items_df[["order_id", "ship_raw"]].copy()
+    tmp["_kind"] = tmp["ship_raw"].map(classify_ship_raw)
+
+    def _vote(series: pd.Series) -> str:
+        vals = [v for v in series.dropna().tolist() if v in SETTLEMENT_SHIP_VALUES]
+        if not vals:
+            return "택배"
+        c = Counter(vals)
+        best_n = c.most_common(1)[0][1]
+        tops = [k for k, v in c.items() if v == best_n]
+        if len(tops) == 1:
+            return tops[0]
+        return "택배"
+
+    out = tmp.groupby("order_id", sort=False)["_kind"].agg(_vote)
+    # SQLite 등에서 order_id dtype이 섞이면 대시보드 map 시 전부 택배로 떨어질 수 있어 인덱스를 문자열로 고정
+    out.index = out.index.astype(str)
+    return out
+
+
 def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     alias_to_canon, canonicals = load_alias_map(alias_path)
     order_rows: dict[str, dict[str, Any]] = {}
@@ -321,6 +533,8 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
                 "address": it.address_raw,
                 "phone": it.phone_raw,
                 "delivery_request": it.delivery_request_raw,
+                # 엑셀 A열 특이사항(주문 ○○님 ...) 자동 반영
+                "attention_note": it.attention_note_raw,
                 # 주문목록(요약): items에서 생성
                 "order_list": None,
                 # 특이사항(리콜/클레임 등) - 수기 입력용
@@ -338,6 +552,7 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
                 ("address", it.address_raw),
                 ("phone", it.phone_raw),
                 ("delivery_request", it.delivery_request_raw),
+                ("attention_note", it.attention_note_raw),
             ]:
                 if (o.get(k) is None or str(o.get(k)).strip() == "") and v:
                     o[k] = v
@@ -540,11 +755,14 @@ def write_sqlite(db_path: str, orders_df: pd.DataFrame, items_df: pd.DataFrame) 
 
 def iter_xlsx_files(input_dir: str) -> list[str]:
     out: list[str] = []
-    for name in os.listdir(input_dir):
-        if name.startswith("~$"):
-            continue
-        if name.lower().endswith(".xlsx"):
-            out.append(os.path.join(input_dir, name))
+    if not os.path.isdir(input_dir):
+        return out
+    for root, _dirs, files in os.walk(input_dir):
+        for name in files:
+            if name.startswith("~$"):
+                continue
+            if name.lower().endswith(".xlsx"):
+                out.append(os.path.join(root, name))
     return sorted(out)
 
 
