@@ -1,0 +1,12 @@
+services:
+  mutomo:
+    build: .
+    ports:
+      - "8501:8501"
+    working_dir: /app
+    volumes:
+      # Persist DB + editable product aliases on host
+      - ./mutomo.sqlite:/app/mutomo.sqlite
+      - ./product_aliases.yml:/app/product_aliases.yml
+    environment:
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false

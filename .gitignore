@@ -1,0 +1,33 @@
+### Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+
+### Virtualenv
+.venv/
+venv/
+ENV/
+env/
+
+### Editor/OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+### Local runtime artifacts
+*.log
+
+### Data / DB / backups (do not commit)
+mutomo.sqlite
+mutomo*.sqlite
+backups/
+
+### Ingest artifacts / exports
+unknown_products.csv
+*.xlsx
+*.xlsm
+*.xls
+*.zip
+

@@ -1,0 +1,9 @@
+# Canonical product name -> list of aliases seen in spreadsheets.
+# Add more aliases over time. Matching is case/whitespace-insensitive.
+#
+# Example:
+# "키큰수납장":
+#   - "키큰 수납장"
+#   - "키큰수납장 "
+#
+{}
