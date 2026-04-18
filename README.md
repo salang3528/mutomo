@@ -6,7 +6,7 @@
 
 ## 요구 사항
 
-- **Python** 3.11 이상 (3.12·3.13 권장)
+- **Python** 3.11 이상 (3.12·3.13·3.14 등 최신 버전도 사용 가능)
 - Windows / macOS / Linux (현장 PC는 Windows 기준 문서화)
 
 ---
@@ -54,6 +54,7 @@ python ingest_xlsx.py --db mutomo.sqlite --aliases product_aliases.yml
 - 기본으로 **`order_list`** 아래의 모든 `.xlsx`를 읽습니다.
 - **재수집** 시: 주문서에서 다시 읽는 필드는 덮어쓰고, 대시보드에서 바꾼 **상태·출고시각·특이사항** 등은 가능한 범위에서 유지됩니다.
 - 매핑되지 않은 상품명은 **`unknown_products.csv`**에 쌓입니다. `product_aliases.yml`에 별칭을 추가한 뒤 다시 수집하면 됩니다.
+- 수집 시 **동일 연락처 힌트**용 `phone_norm`·`party_key` 등은 `recipient_identity` 로직으로 보강됩니다.
 
 ---
 
@@ -63,9 +64,23 @@ python ingest_xlsx.py --db mutomo.sqlite --aliases product_aliases.yml
 python -m streamlit run dashboard.py
 ```
 
-- **설정**에서 DB 경로를 지정합니다 (기본 `mutomo.sqlite`).
-- **오늘 접수 / 전체 목록**에서 주문 확인, **받는분 검색** 후 여러 건 선택 → **접수 / 출고 / 클레임 / 마감 / 납품취소**.
+- **설정**(사이드바): DB 경로(기본 `mutomo.sqlite`), **상태 필터**, ‘오늘 접수’ 기준(구매일자 vs 수집시각), 관리 컬럼 표시.
+- 메인 **탭**
+  - **판매 요약**: 오늘·최근 접수/출고 패널 등
+  - **이름 검색**: 받는분 검색·다중 선택 → **전체 접수 목록** 표에서 출고·클레임 등 일괄 처리
+  - **기간별 판매집계**: 기간·기준일·포함 상태를 **이 탭 안에서만** 정해 주문 건수·수량·금액(아래 단가표 연동)을 봅니다. 사이드바 상태 필터와는 별개입니다.
+- 사이드바 **접수목록 선택 상세** / **클레임·특이사항**: 표에서 고른 주문에 대해 품목·메모 확인·저장.
+- 화면 하단 **제품 목록(집계)**: 정규 상품명·엑셀 원문 기준 줄 수·수량 합(상태 필터와 동일 범위).
 - 엑셀만 바꾼 뒤 DB가 그대로면 **ingest**를 다시 실행하고, 사이드바 **DB 다시 읽기** 또는 브라우저 새로고침을 사용합니다.
+
+---
+
+## 단가표 (`단가표.csv`)
+
+저장소 **루트**에 두는 CSV입니다. 열 예: **`엑셀상품명`**, **`판매가격`**, **`광진가격(60%)`**.  
+수집된 품목명(`product_raw` / `product_canonical`)과 **ingest와 동일한 정규화 키**로 매칭해, **기간별 판매집계** 탭에서만 합계 금액에 반영합니다(단가 행을 대시보드에 뿌리지는 않습니다).
+
+> 민감하거나 자주 바뀌는 경우 Git에 포함하지 않고 PC에만 두고 싶다면 `.gitignore`에 `단가표.csv`를 추가하면 됩니다.
 
 ---
 
@@ -88,6 +103,7 @@ python -m streamlit run dashboard.py
 - 같은 주문에서 아래 줄 배송이 **비어 있으면** 위쪽 값을 이어 씁니다 (빈 칸을 택배로만 보는 오탐 완화).
 - 한 주문에 택배·직접이 **함께 있으면 혼합**: 두 피킹 시트에 각 한 줄.  
   `택배 행 수 + 직접 행 수 = 출고 주문 수 + 혼합 주문 수`.
+- 피킹 시트 **특이사항** 열에는 엑셀 자동 특이사항·수기 특이사항만 넣고, **주문목록(물품 요약)** 은 옆 **품목** 열에만 둡니다. `출고_주문`의 **특이사항(엑셀자동)** 은 DB `order_list`와 겹치는 문구를 정리해 중복 표시를 줄입니다.
 
 ---
 
@@ -115,7 +131,7 @@ python -m streamlit run dashboard.py
 python backup_db.py --db mutomo.sqlite --out backups --keep-days 30
 ```
 
-다른 PC로 옮길 때: `mutomo.sqlite`, `product_aliases.yml`, 필요 시 `order_list`(또는 사용 중인 입력 폴더) 원본 엑셀.
+다른 PC로 옮길 때: `mutomo.sqlite`, `product_aliases.yml`, 필요 시 `단가표.csv`, `order_list`(또는 사용 중인 입력 폴더) 원본 엑셀.
 
 ---
 
@@ -125,7 +141,8 @@ python backup_db.py --db mutomo.sqlite --out backups --keep-days 30
 docker compose up --build
 ```
 
-`http://localhost:8501` — 호스트의 `mutomo.sqlite`, `product_aliases.yml` 마운트 (`docker-compose.yml`).
+`http://localhost:8501` — 호스트의 `mutomo.sqlite`, `product_aliases.yml` 마운트 (`docker-compose.yml`).  
+단가표를 컨테이너에서 쓰려면 같은 방식으로 `단가표.csv`를 마운트하거나 이미지에 포함하세요.
 
 ---
 
