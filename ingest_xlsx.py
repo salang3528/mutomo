@@ -14,6 +14,8 @@ import pandas as pd
 import yaml
 from rapidfuzz import fuzz, process
 
+from recipient_identity import assign_recipient_ids
+
 
 EXPECTED_COLS = 13  # current vendor sheet has 13 columns (incl. address/phone/request)
 
@@ -34,6 +36,9 @@ COLOR_WORDS = [
     "브라운",
     "내추럴",
     "자작",
+    # 원단/시트 상품명 (규격 열은 cm만 있고 색 열에만 적히는 경우)
+    "올드블루진스",
+    "런던브릭",
 ]
 
 
@@ -98,6 +103,16 @@ def _first_color(text: str | None) -> str | None:
         if c in t:
             return c
     return None
+
+
+def _shelf_color_fallback_from_leg_cell(leg_cell: str | None) -> str | None:
+    """책장색 열이 비었을 때, '다리' 열에 실제로는 원단/컬러만 적힌 행(예: '올드블루진스 / 25cm') 보정."""
+    if not leg_cell:
+        return None
+    t = str(leg_cell).replace("\n", " ")
+    if re.search(r"다리", t):
+        return None
+    return _first_color(t)
 
 
 def extract_leg_color(text: str | None) -> str | None:
@@ -575,7 +590,10 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
                 "note_raw": it.leg_color_raw,
                 "size": extract_size(it.spec_raw) or extract_size(it.leg_color_raw) or extract_size(it.product_raw),
                 # Prefer explicit sheet columns when present; otherwise fallback to keyword extraction.
-                "shelf_color": it.shelf_color_raw or _first_color(it.spec_raw) or _first_color(it.product_raw),
+                "shelf_color": it.shelf_color_raw
+                or _first_color(it.spec_raw)
+                or _first_color(it.product_raw)
+                or _shelf_color_fallback_from_leg_cell(it.leg_color_raw),
                 "leg_color": extract_leg_color(it.leg_color_raw) or extract_leg_color(it.spec_raw) or extract_leg_color(it.product_raw),
                 "qty": _to_int(it.qty_raw),
                 "ship_raw": it.ship_raw,
@@ -653,10 +671,13 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
                 "status",
                 "shipped_at",
                 "created_at",
+                "phone_norm",
+                "party_key",
             ]
         )
     else:
         orders_df = orders_df.sort_values(["source_file", "group_no"], na_position="last")
+        orders_df = assign_recipient_ids(orders_df)
 
     if len(items_df) == 0:
         items_df = pd.DataFrame(
@@ -745,6 +766,7 @@ def write_sqlite(db_path: str, orders_df: pd.DataFrame, items_df: pd.DataFrame) 
             existing_orders = pd.DataFrame()
 
         merged_orders = _merge_orders_preserving_edits(existing_orders, orders_df)
+        merged_orders = assign_recipient_ids(merged_orders)
         merged_orders.to_sql("orders", con, if_exists="replace", index=False)
 
         # Items are derived from xlsx; safe to replace.
