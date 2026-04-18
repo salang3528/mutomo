@@ -19,6 +19,9 @@ Desktop.ini
 ### Local runtime artifacts
 *.log
 
+### Nested / mistaken copy of repo (use repo-root order_list/ only)
+mutomo/
+
 ### Data / DB / backups (do not commit)
 mutomo.sqlite
 mutomo*.sqlite

@@ -24,12 +24,21 @@ python -m pip install -r requirements.txt
 
 ## 주문 엑셀 두는 곳
 
-`ingest_xlsx.py` 기본 입력 폴더는 저장소 루트의 **`order_list`** 입니다 (없으면 자동 생성).
+**항상 저장소 루트의 `order_list` 폴더만** 쓰면 됩니다. `ingest_xlsx.py` 기본값과 같습니다 (없으면 자동 생성).
 
-다른 경로를 쓰려면 예:
+과거에 `mutomo/order_list/…`처럼 중첩된 경로에 두었거나, 실수로 **`mutomo/` 아래에 저장소를 또 복제**한 경우가 있으면, 루트에서 한 번 정리합니다.
 
 ```powershell
-python ingest_xlsx.py --input-dir mutomo\order_list --db mutomo.sqlite --aliases product_aliases.yml
+python tools\flatten_order_list.py --dry-run   # 미리 보기
+python tools\flatten_order_list.py             # mutomo/ 아래 .xlsx → order_list/ 로 이동
+```
+
+이후 **`mutomo/` 폴더는 삭제**해 두세요(중복 클론·`.venv`만 있으면 용량만 큼). Git에는 `mutomo/`를 올리지 않도록 `.gitignore`에 넣어 두었습니다.
+
+다른 드라이브만 쓰고 싶을 때만 예:
+
+```powershell
+python ingest_xlsx.py --input-dir "D:\주문백업\order_list" --db mutomo.sqlite --aliases product_aliases.yml
 ```
 
 > 고객 정보가 들어 있는 `.xlsx`와 운영 DB(`mutomo.sqlite`)는 **Git에 올리지 마세요** (`.gitignore` 처리).
