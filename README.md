@@ -75,6 +75,27 @@ python -m streamlit run dashboard.py
 
 ---
 
+## 회사·다른 PC에서 이어서 작업
+
+**코드**는 Git으로 맞추고, **주문·DB·단가**는 Git 밖에서 프로젝트 루트로 옮깁니다.
+
+1. **저장소** — 새 PC면 `git clone` 후 해당 폴더에서 작업. 이미 받아 둔 폴더면 `git pull`으로 최신 반영.
+2. **파이썬** — [설치](#설치)와 같이 `venv` → `pip install -r requirements.txt` (회사 PC Python 버전이 3.11 이상인지 확인).
+3. **데이터 복사** (USB·외장디스크·회사 허용 NAS 등 → 저장소 **루트**에 둠)
+
+   | 상황 | 가져올 것 |
+   |------|------------|
+   | 대시보드·출고 이력 그대로 | `mutomo.sqlite` 통째 복사 |
+   | DB는 새로 만들 계획 | `order_list\` 안 **주문 `.xlsx`** 만 복사 후 아래 [엑셀 → DB 수집](#엑셀--db-수집) 실행 |
+   | 기간별 금액 집계 | **`단가표.csv`** (레포에 없을 수 있음 → 같이 복사) |
+   | 별칭을 회사에서 쓰는 경우 | `product_aliases.yml` |
+
+4. **DB 만들기** — 집 DB를 복사하지 않을 때만, 엑셀을 둔 뒤 `python ingest_xlsx.py --db mutomo.sqlite --aliases product_aliases.yml` 로 채움.
+5. **실행** — `python -m streamlit run dashboard.py` 후 사이드바 **설정**의 **DB 경로**가 회사 PC의 `mutomo.sqlite`를 가리키는지 확인(폴더가 다르면 여기만 수정).
+6. **끝날 때** — 코드·README 변경은 `git commit` / `git push`. DB·엑셀·단가표는 **회사 보안·백업 규칙**에 맞게 별도 보관(Git에 올리지 않음).
+
+---
+
 ## 단가표 (`단가표.csv`)
 
 저장소 **루트**에 두는 CSV입니다. 열 예: **`엑셀상품명`**, **`판매가격`**, **`광진가격(60%)`**.  
