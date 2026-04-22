@@ -6,6 +6,7 @@ import io
 import os
 import re
 import sqlite3
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import streamlit as st
@@ -13,7 +14,7 @@ import streamlit.components.v1 as st_components
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 from ingest_xlsx import classify_ship_raw, infer_settlement_ship_series
-from pricing import format_won, load_unit_prices
+from pricing import format_won, load_unit_prices, lookup_line_price
 from recipient_identity import assign_recipient_ids
 from sales_period_agg import summarize_sales_period
 
@@ -280,7 +281,7 @@ def _db_ready(db_path: str) -> tuple[bool, str]:
 
 
 def _migrate_orders_schema(db_path: str) -> None:
-    """orders에 shipped_at·phone_norm·party_key 컬럼 보장 및 party 컬럼 백필."""
+    """orders에 shipped_at·closed_at·phone_norm·party_key 컬럼 보장 및 party 컬럼 백필."""
     con = sqlite3.connect(db_path)
     try:
         cur = con.cursor()
@@ -288,6 +289,8 @@ def _migrate_orders_schema(db_path: str) -> None:
         cols = {row[1] for row in cur.fetchall()}
         if "shipped_at" not in cols:
             cur.execute("ALTER TABLE orders ADD COLUMN shipped_at TEXT")
+        if "closed_at" not in cols:
+            cur.execute("ALTER TABLE orders ADD COLUMN closed_at TEXT")
         if "phone_norm" not in cols:
             cur.execute("ALTER TABLE orders ADD COLUMN phone_norm TEXT")
         if "party_key" not in cols:
@@ -323,6 +326,155 @@ def _migrate_orders_schema(db_path: str) -> None:
 def _to_date_series(s: pd.Series) -> pd.Series:
     # created_at is ISO string; coerce anything else safely
     return pd.to_datetime(s, errors="coerce").dt.date
+
+
+try:
+    _SEOUL = ZoneInfo("Asia/Seoul")
+except ZoneInfoNotFoundError:
+    # Windows 환경에서 tz database가 없으면 ZoneInfo가 실패할 수 있음 → 고정 KST(+09:00)로 폴백
+    _SEOUL = dt.timezone(dt.timedelta(hours=9), name="KST")
+
+
+def _shipped_at_calendar_date_series(shipped_at: pd.Series) -> pd.Series:
+    """출고일 집계·엑셀 필터용: shipped_at → 대한민국 달력 날짜.
+
+    - timezone-aware(예: ...+00:00)는 **Asia/Seoul**로 바꾼 뒤 날짜를 씁니다.
+      (전날 UTC 오후 시각이 한국에서는 다음 날 자정인 경우 UTC `.date()`만 쓰면 하루 밀림)
+    - naïve ISO(대시보드에서 `datetime.now().isoformat()`으로 넣은 값 등)는 **그 벽시계 그대로** 날짜를 씁니다.
+    """
+    out: list[dt.date | None] = []
+    for v in shipped_at.tolist():
+        if v is None:
+            out.append(None)
+            continue
+        try:
+            if isinstance(v, float) and pd.isna(v):
+                out.append(None)
+                continue
+        except Exception:
+            pass
+        t = pd.to_datetime(v, errors="coerce")
+        if pd.isna(t):
+            out.append(None)
+            continue
+        ts = pd.Timestamp(t)
+        try:
+            if ts.tzinfo is None:
+                ts2 = ts.tz_localize(_SEOUL, ambiguous="NaT", nonexistent="NaT")
+            else:
+                ts2 = ts.tz_convert(_SEOUL)
+        except Exception:
+            ts2 = ts
+        if pd.isna(ts2):
+            out.append(None)
+        else:
+            out.append(pd.Timestamp(ts2).date())
+    return pd.Series(out, index=shipped_at.index, dtype=object)
+
+
+def _ensure_settlements_table(db_path: str) -> None:
+    """Create settlements table if missing (idempotent)."""
+    con = sqlite3.connect(db_path)
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settlements (
+              period_start TEXT NOT NULL,
+              period_end   TEXT NOT NULL,
+              basis        TEXT NOT NULL,
+              expected_sale REAL DEFAULT 0,
+              expected_gj   REAL DEFAULT 0,
+              paid_amount   REAL DEFAULT 0,
+              note          TEXT,
+              updated_at    TEXT,
+              PRIMARY KEY (period_start, period_end, basis)
+            )
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _calc_amounts_for_orders(
+    items_df: pd.DataFrame, order_ids: set[str], price_map: dict
+) -> tuple[float, float, int, int]:
+    """Return (sale_amount, gwangjin_amount, n_unpriced_lines, unpriced_qty) for given orders."""
+    if not order_ids or items_df is None or len(items_df) == 0 or "order_id" not in items_df.columns:
+        return 0.0, 0.0, 0, 0
+    it = items_df[items_df["order_id"].astype(str).isin(order_ids)].copy()
+    if len(it) == 0:
+        return 0.0, 0.0, 0, 0
+    q = pd.to_numeric(it.get("qty"), errors="coerce").fillna(0).astype(int).clip(lower=0)
+    it["_q"] = q
+    sale_amount = 0.0
+    gj_amount = 0.0
+    n_unpriced = 0
+    unpriced_qty = 0
+    for _, r in it.iterrows():
+        qty_i = int(r.get("_q") or 0)
+        pr = lookup_line_price(r, price_map) if price_map else None
+        if pr is None:
+            n_unpriced += 1
+            unpriced_qty += qty_i
+            continue
+        try:
+            sale_amount += float(pr.get("판매가격") or 0) * qty_i
+        except (TypeError, ValueError):
+            pass
+        gj_v = pr.get("광진가격(60%)")
+        try:
+            if gj_v is not None and not (isinstance(gj_v, float) and pd.isna(gj_v)):
+                gj_amount += float(gj_v) * qty_i
+        except (TypeError, ValueError):
+            pass
+    return float(sale_amount), float(gj_amount), int(n_unpriced), int(unpriced_qty)
+
+
+def _calc_order_amount_map(items_df: pd.DataFrame, order_ids: set[str], price_map: dict) -> dict[str, tuple[float, float]]:
+    """order_id -> (sale_amount, gwangjin_amount) using 단가표. Missing prices contribute 0."""
+    out: dict[str, tuple[float, float]] = {}
+    if not order_ids or items_df is None or len(items_df) == 0 or "order_id" not in items_df.columns:
+        return out
+    it = items_df[items_df["order_id"].astype(str).isin(order_ids)].copy()
+    if len(it) == 0:
+        return out
+    it["_oid"] = it["order_id"].astype(str)
+    it["_q"] = pd.to_numeric(it.get("qty"), errors="coerce").fillna(0).astype(int).clip(lower=0)
+    acc_sale: dict[str, float] = {}
+    acc_gj: dict[str, float] = {}
+    for _, r in it.iterrows():
+        oid = str(r.get("_oid") or "").strip()
+        if not oid:
+            continue
+        q = int(r.get("_q") or 0)
+        pr = lookup_line_price(r, price_map) if price_map else None
+        if pr is None or q <= 0:
+            continue
+        try:
+            acc_sale[oid] = acc_sale.get(oid, 0.0) + float(pr.get("판매가격") or 0) * q
+        except (TypeError, ValueError):
+            pass
+        gj_v = pr.get("광진가격(60%)")
+        try:
+            if gj_v is not None and not (isinstance(gj_v, float) and pd.isna(gj_v)):
+                acc_gj[oid] = acc_gj.get(oid, 0.0) + float(gj_v) * q
+        except (TypeError, ValueError):
+            pass
+    for oid in order_ids:
+        out[str(oid)] = (float(acc_sale.get(str(oid), 0.0)), float(acc_gj.get(str(oid), 0.0)))
+    return out
+
+
+def _ship_bucket_for_order(items_all: pd.DataFrame, order_id: str) -> str:
+    """택배/직접/혼합 (품목 배송란 기준)."""
+    ht, hd = _order_picking_sheet_hits(items_all, order_id)
+    if ht and hd:
+        return "혼합"
+    if hd:
+        return "직접"
+    return "택배"
 
 
 @st.cache_data
@@ -875,7 +1027,7 @@ def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame
         shipped = shipped[shipped["status"] == "출고"]
     # Filter to "today shipped" when shipped_at exists
     if "shipped_at" in shipped.columns:
-        shipped["_shipped_date"] = pd.to_datetime(shipped["shipped_at"], errors="coerce").dt.date
+        shipped["_shipped_date"] = _shipped_at_calendar_date_series(shipped["shipped_at"])
         shipped = shipped[shipped["_shipped_date"] == shipped_date].drop(columns=["_shipped_date"], errors="ignore")
     shipped = shipped.reset_index(drop=True)
 
@@ -1062,6 +1214,35 @@ def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame
             axis=1,
         )
 
+    if "shipped_at" in order_sheet.columns:
+
+        def _fmt_shipped_at_kst(v: object) -> str:
+            if v is None:
+                return ""
+            if isinstance(v, str) and not v.strip():
+                return ""
+            try:
+                if isinstance(v, float) and pd.isna(v):
+                    return ""
+            except Exception:
+                pass
+            t = pd.to_datetime(v, errors="coerce")
+            if pd.isna(t):
+                return str(v).strip()
+            ts = pd.Timestamp(t)
+            try:
+                if ts.tzinfo is None:
+                    ts2 = ts.tz_localize(_SEOUL, ambiguous="NaT", nonexistent="NaT")
+                else:
+                    ts2 = ts.tz_convert(_SEOUL)
+            except Exception:
+                ts2 = ts
+            if pd.isna(ts2):
+                return str(v).strip()
+            return pd.Timestamp(ts2).strftime("%Y-%m-%d %H:%M:%S") + " (KST)"
+
+        order_sheet["shipped_at"] = order_sheet["shipped_at"].map(_fmt_shipped_at_kst)
+
     # Items sheet: 준비할 품목/수량만 (품목별 합산)
     if len(shipped) and "order_id" in shipped.columns and "order_id" in items_all.columns:
         item_sheet = items_all[items_all["order_id"].isin(shipped["order_id"])].copy()
@@ -1102,17 +1283,40 @@ def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame
         item_sheet["_품목"] = item_sheet.apply(_item_key, axis=1)
         item_sheet["_수량"] = pd.to_numeric(item_sheet.get("qty"), errors="coerce").fillna(0).astype(int)
 
-        def _ship_join(s: pd.Series) -> str:
-            vals = sorted({str(x).strip() for x in s.dropna().tolist() if str(x).strip()})
-            return " / ".join(vals) if vals else ""
+        def _ship_join_for_export(s: pd.Series) -> str:
+            """같은 품목 키로 묶인 행들의 배송란 → 출고_품목에는 항상 '직접'·'택배'만 표기(미기재·판별불가는 택배)."""
+            kinds: set[str] = set()
+            for x in s.tolist():
+                if x is None:
+                    continue
+                try:
+                    if isinstance(x, float) and pd.isna(x):
+                        continue
+                except Exception:
+                    pass
+                t = str(x).strip()
+                if not t:
+                    continue
+                c = classify_ship_raw(x)
+                if c == "직접배송":
+                    kinds.add("직접")
+                elif c == "택배":
+                    kinds.add("택배")
+                else:
+                    kinds.add("택배")
+            if not kinds:
+                return "택배"
+            order = ("직접", "택배")
+            return " / ".join(k for k in order if k in kinds)
 
         item_sheet = (
             item_sheet.groupby("_품목", as_index=False)
-            .agg(_수량=("_수량", "sum"), 엑셀배송=("ship_raw", _ship_join))
+            .agg(_수량=("_수량", "sum"), 엑셀배송=("ship_raw", _ship_join_for_export))
             .rename(columns={"_품목": "품목", "_수량": "수량"})
             .sort_values(["품목"])
             .reset_index(drop=True)
         )
+        item_sheet["엑셀배송"] = item_sheet["엑셀배송"].replace("", "택배").fillna("택배")
     else:
         item_sheet = pd.DataFrame(columns=["품목", "수량", "엑셀배송"])
 
@@ -1297,6 +1501,9 @@ def init_shared_session_state() -> None:
 
 # 이름 검색 → 전체 접수 표 선택 연동 시 한 번에 넘길 최대 행 수 (브라우저·Streamlit 부담 완화)
 _MAX_SEARCH_TO_TABLE_ROWS = 2000
+
+# 설정 사이드바「최근 수집 파일」표: DB에 있는 소스 파일 전체가 아니라, 마지막 수집 시각 기준 상위 N건만 미리보기
+_RECENT_SOURCE_FILES_SIDEBAR_PREVIEW = 50
 
 
 def _unique_receiver_names(orders: pd.DataFrame) -> list[str]:
@@ -1607,10 +1814,8 @@ def render_receiver_name_search(
         st.session_state.pop("_search_sync_order_ids", None)
         st.session_state.pop("_search_sync_sig", None)
         st.session_state["table_sync_from_search"] = False
-        if "mutomo_full_orders_df" in st.session_state:
-            st.session_state["mutomo_full_orders_df"] = {
-                "selection": {"rows": [], "columns": [], "cells": []},
-            }
+        # 검색어가 없을 때도 아래 "전체 접수 목록" 표는 그대로 두어야 함.
+        # 여기서 mutomo_full_orders_df 선택을 매 리런마다 비우면, 이름 검색 없이 표만 클릭해도 선택이 즉시 풀린다.
         return
 
     st.divider()
@@ -1928,7 +2133,7 @@ def render_receiver_name_search(
                 cur = con.cursor()
                 now = dt.datetime.now().isoformat(timespec="seconds")
                 cur.executemany(
-                    "UPDATE orders SET status=?, shipped_at=COALESCE(shipped_at, ?) WHERE order_id=?",
+                    "UPDATE orders SET status=?, shipped_at=COALESCE(NULLIF(shipped_at,''), ?), closed_at=NULL WHERE order_id=?",
                     [("출고", now, oid) for oid in pending_ship],
                 )
                 con.commit()
@@ -1943,7 +2148,7 @@ def render_receiver_name_search(
         try:
             cur = con.cursor()
             cur.executemany(
-                "UPDATE orders SET status=? WHERE order_id=?",
+                "UPDATE orders SET status=?, closed_at=NULL WHERE order_id=?",
                 [("클레임", oid) for oid in pick_ids],
             )
             con.commit()
@@ -1958,7 +2163,7 @@ def render_receiver_name_search(
         try:
             cur = con.cursor()
             cur.executemany(
-                "UPDATE orders SET status=?, shipped_at=NULL WHERE order_id=?",
+                "UPDATE orders SET status=?, shipped_at=NULL, closed_at=NULL WHERE order_id=?",
                 [("접수", oid) for oid in pick_ids],
             )
             con.commit()
@@ -1973,8 +2178,8 @@ def render_receiver_name_search(
         try:
             cur = con.cursor()
             cur.executemany(
-                "UPDATE orders SET status=? WHERE order_id=?",
-                [("마감", oid) for oid in pick_ids],
+                "UPDATE orders SET status=?, closed_at=COALESCE(closed_at, ?) WHERE order_id=?",
+                [("마감", dt.datetime.now().isoformat(timespec="seconds"), oid) for oid in pick_ids],
             )
             con.commit()
         finally:
@@ -1988,7 +2193,7 @@ def render_receiver_name_search(
         try:
             cur = con.cursor()
             cur.executemany(
-                "UPDATE orders SET status=? WHERE order_id=?",
+                "UPDATE orders SET status=?, closed_at=NULL WHERE order_id=?",
                 [("납품취소", oid) for oid in pick_ids],
             )
             con.commit()
@@ -2084,42 +2289,18 @@ def render_receiver_name_search(
 
 
 def render_sales_period_tab(orders_all: pd.DataFrame, items_all: pd.DataFrame) -> None:
-    """이름 검색과 같이 메인 탭에서 기간·상태별 집계(단가표는 합계만 반영)."""
-    st.subheader("기간별 판매집계")
-    st.caption(
-        "기간·포함 상태는 **이 탭에서만** 적용됩니다(사이드바 **상태 필터**와 별개). "
-        "금액은 프로젝트 루트 **단가표.csv**로 계산하며, 단가 행은 표시하지 않습니다."
-    )
+    """3번째 탭: 마감(청구) 전용 화면."""
+    st.subheader("마감(청구) 관리")
+    st.caption("복잡한 집계는 숨기고, **마감/입금/미수/이슈**만 관리합니다.")
     today = dt.date.today()
     c1, c2 = st.columns(2)
     with c1:
-        d_start = st.date_input("시작일", value=today - dt.timedelta(days=30), key="dash_sales_d0")
+        d_start = st.date_input("기간 시작일(출고일)", value=today - dt.timedelta(days=30), key="dash_sales_d0")
     with c2:
-        d_end = st.date_input("종료일", value=today, key="dash_sales_d1")
+        d_end = st.date_input("기간 종료일(출고일)", value=today, key="dash_sales_d1")
     if d_start > d_end:
         st.warning("시작일이 종료일보다 늦습니다.")
         return
-
-    basis_label = st.radio(
-        "기준일",
-        options=[
-            ("purchase", "구매일자(파일명에서 추출)"),
-            ("created", "수집시각(created_at)"),
-            ("shipped", "출고일(shipped_at) — 미출고 주문은 기간에 안 잡힘"),
-        ],
-        format_func=lambda x: x[1],
-        horizontal=True,
-        key="dash_sales_basis",
-    )
-    date_basis = basis_label[0]
-
-    status_sel = st.multiselect(
-        "포함할 주문 상태 (비우면 전체)",
-        options=["접수", "클레임", "출고", "마감", "납품취소"],
-        default=["접수", "출고", "클레임", "마감"],
-        key="dash_sales_status_filter",
-    )
-    status_filter = None if not status_sel else set(status_sel)
 
     _root = os.path.dirname(os.path.abspath(__file__))
     price_path = os.path.join(_root, "단가표.csv")
@@ -2129,42 +2310,290 @@ def render_sales_period_tab(orders_all: pd.DataFrame, items_all: pd.DataFrame) -
     if price_warns:
         st.info("단가표: " + " ".join(w for w in price_warns if w))
 
-    out = summarize_sales_period(
-        orders_all,
-        items_all,
-        price_map,
-        d_start,
-        d_end,
-        date_basis=date_basis,
-        status_filter=status_filter,
-    )
+    st.divider()
+    st.caption("기준: 출고일(`shipped_at`, 한국시간). shipped_at이 없는 주문은 기간에 포함되지 않습니다.")
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    with m1:
-        st.metric("주문 건수", f"{out['n_orders']:,}")
-    with m2:
-        st.metric("품목 라인 수", f"{out['n_item_lines']:,}")
-    with m3:
-        st.metric("판매 수량 합", f"{out['qty_sum']:,}")
-    with m4:
-        st.metric("판매금액(단가표)", format_won(out["sale_amount"]))
-    with m5:
-        st.metric("광진금액(단가표)", format_won(out["gwangjin_amount"]))
-    with m6:
-        st.metric("단가 미매칭 라인", f"{out['n_unpriced_lines']:,}")
+    k0, k1 = st.columns(2)
+    with k0:
+        close_d0 = st.date_input("마감 대상 시작일(출고일)", value=d_start, key="dash_close_d0")
+    with k1:
+        close_d1 = st.date_input("마감 대상 종료일(출고일)", value=d_end, key="dash_close_d1")
 
-    if out["unpriced_qty"]:
-        st.caption(f"단가표에 없는 품목의 수량 합(참고): **{out['unpriced_qty']:,}**")
-
-    st.subheader("상품별 요약")
-    bp = out["by_product"]
-    if len(bp) == 0:
-        st.info("해당 기간·조건에 맞는 품목이 없습니다.")
+    if close_d0 > close_d1:
+        st.warning("시작일이 종료일보다 늦습니다.")
     else:
-        show = bp.copy()
-        show["판매금액"] = show["판매금액"].map(lambda x: format_won(x))
-        show["광진금액"] = show["광진금액"].map(lambda x: format_won(x))
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        db_path = str(st.session_state.get("mutomo_db_path", "mutomo.sqlite"))
+        _ensure_settlements_table(db_path)
+
+        base = orders_all.copy()
+        if "shipped_at" in base.columns:
+            base["_ship_day"] = _shipped_at_calendar_date_series(base["shipped_at"])
+        else:
+            base["_ship_day"] = pd.Series([None] * len(base), index=base.index, dtype=object)
+
+        in_ship_range = base["_ship_day"].notna() & (base["_ship_day"] >= close_d0) & (base["_ship_day"] <= close_d1)
+        base = base.loc[in_ship_range].copy()
+
+        stt = base["status"].astype(str).str.strip() if "status" in base.columns else pd.Series([""] * len(base))
+        is_closed = pd.Series([False] * len(base), index=base.index)
+        if "closed_at" in base.columns:
+            ca = base["closed_at"].astype(str).fillna("").str.strip()
+            is_closed = (ca != "") & (ca.str.lower() != "nan")
+
+        # 마감 대상(기본): 출고 상태 & 아직 closed_at 없음
+        cand = base[(stt == "출고") & (~is_closed)].copy()
+        already = base[(stt == "마감") | is_closed].copy()
+
+        # 금액 요약 (단가표 기준)
+        closed_ids = set(already["order_id"].astype(str).tolist()) if "order_id" in already.columns else set()
+        cand_ids = set(cand["order_id"].astype(str).tolist()) if "order_id" in cand.columns else set()
+        closed_sale, closed_gj, closed_unp_lines, closed_unp_qty = _calc_amounts_for_orders(items_all, closed_ids, price_map)
+        cand_sale, cand_gj, cand_unp_lines, cand_unp_qty = _calc_amounts_for_orders(items_all, cand_ids, price_map)
+
+        # 배송 유형(택배/직접/혼합)별 금액/건수
+        def _bucket_sums(order_ids: set[str]) -> dict[str, dict[str, float | int]]:
+            d: dict[str, dict[str, float | int]] = {k: {"n": 0, "sale": 0.0, "gj": 0.0} for k in ("택배", "직접", "혼합")}
+            if not order_ids:
+                return d
+            amt = _calc_order_amount_map(items_all, order_ids, price_map)
+            for oid in order_ids:
+                b = _ship_bucket_for_order(items_all, str(oid))
+                sale, gj = amt.get(str(oid), (0.0, 0.0))
+                d[b]["n"] = int(d[b]["n"]) + 1
+                d[b]["sale"] = float(d[b]["sale"]) + float(sale)
+                d[b]["gj"] = float(d[b]["gj"]) + float(gj)
+            return d
+
+        closed_by = _bucket_sums(closed_ids)
+        cand_by = _bucket_sums(cand_ids)
+
+        m_a, m_b, m_c = st.columns(3)
+        with m_a:
+            st.metric("기간 내 출고(전체)", int((stt == "출고").sum()))
+        with m_b:
+            st.metric("마감 대상(출고 & 미마감)", int(len(cand)))
+        with m_c:
+            st.metric("이미 마감(또는 closed_at 존재)", int(len(already)))
+
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            st.metric("마감된 금액(판매)", format_won(closed_sale))
+        with a2:
+            st.metric("마감된 금액(광진)", format_won(closed_gj))
+        with a3:
+            st.metric("미마감 출고 금액(판매)", format_won(cand_sale))
+        if closed_unp_qty or cand_unp_qty:
+            st.caption(
+                f"단가 미매칭(참고) — 마감: {closed_unp_lines}라인/{closed_unp_qty}개, "
+                f"미마감: {cand_unp_lines}라인/{cand_unp_qty}개"
+            )
+
+        # 입금/미수 관리 (기간 단위)
+        period_key = (close_d0.isoformat(), close_d1.isoformat(), "shipped")
+        paid_default = 0.0
+        note_default = ""
+        try:
+            con_s = sqlite3.connect(db_path)
+            try:
+                row = con_s.execute(
+                    "SELECT paid_amount, note FROM settlements WHERE period_start=? AND period_end=? AND basis=?",
+                    period_key,
+                ).fetchone()
+                if row:
+                    paid_default = float(row[0] or 0)
+                    note_default = "" if row[1] is None else str(row[1])
+            finally:
+                con_s.close()
+        except Exception:
+            pass
+
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            paid_amount = st.number_input(
+                "입금된 금액(판매 기준)",
+                min_value=0.0,
+                step=10000.0,
+                value=float(paid_default),
+                key="dash_paid_amount",
+                help="이 기간 청구분 중 실제 입금 확인 금액을 적어두면 미수금액이 자동 계산됩니다.",
+            )
+        with p2:
+            st.metric("미수 금액(판매 기준)", format_won(max(0.0, closed_sale - float(paid_amount))))
+        with p3:
+            st.metric("참고: 마감금액-입금금액", format_won(float(closed_sale) - float(paid_amount)))
+        note = st.text_input("메모(선택)", value=note_default, key="dash_settlement_note", placeholder="예) 4/21 입금 확인, 세금계산서 발행완료")
+        if st.button("입금/메모 저장", key="dash_settlement_save"):
+            now = dt.datetime.now().isoformat(timespec="seconds")
+            con_s2 = sqlite3.connect(db_path)
+            try:
+                con_s2.execute(
+                    """
+                    INSERT INTO settlements(period_start, period_end, basis, expected_sale, expected_gj, paid_amount, note, updated_at)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(period_start, period_end, basis) DO UPDATE SET
+                      expected_sale=excluded.expected_sale,
+                      expected_gj=excluded.expected_gj,
+                      paid_amount=excluded.paid_amount,
+                      note=excluded.note,
+                      updated_at=excluded.updated_at
+                    """,
+                    (
+                        period_key[0],
+                        period_key[1],
+                        period_key[2],
+                        float(closed_sale),
+                        float(closed_gj),
+                        float(paid_amount),
+                        note,
+                        now,
+                    ),
+                )
+                con_s2.commit()
+            finally:
+                con_s2.close()
+            st.success("저장했습니다.")
+
+        st.subheader("배송유형별(택배/직접/혼합) 금액")
+        rows = []
+        for b in ("택배", "직접", "혼합"):
+            rows.append(
+                {
+                    "구분": b,
+                    "미수(출고)건수": int(cand_by[b]["n"]),
+                    "미수(출고)판매": format_won(cand_by[b]["sale"]),
+                    "마감건수": int(closed_by[b]["n"]),
+                    "마감판매": format_won(closed_by[b]["sale"]),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=160)
+
+        if len(cand):
+            prev_cols = [c for c in ["_ship_day", "receiver_name", "order_list", "order_id"] if c in cand.columns]
+            prev = cand[prev_cols].copy()
+            if "order_list" in prev.columns:
+                prev["order_list"] = prev["order_list"].astype(str).fillna("").map(lambda x: (x[:80] + "…") if len(x) > 81 else x)
+            prev = prev.rename(columns={"_ship_day": "출고일", "receiver_name": "받는분"})
+            st.dataframe(prev.head(80), use_container_width=True, hide_index=True, height=260)
+
+            confirm = st.checkbox(
+                f"{close_d0.isoformat()} ~ {close_d1.isoformat()} 출고 {len(cand)}건을 마감 처리",
+                value=False,
+                key="dash_close_confirm",
+            )
+            if st.button("기간 마감 실행", type="primary", disabled=(not confirm), key="dash_close_run"):
+                oids = cand["order_id"].astype(str).tolist() if "order_id" in cand.columns else []
+                if not oids:
+                    st.warning("order_id가 없어 처리할 수 없습니다.")
+                else:
+                    now = dt.datetime.now().isoformat(timespec="seconds")
+                    con = sqlite3.connect(st.session_state.get("mutomo_db_path", "mutomo.sqlite"))
+                    try:
+                        cur = con.cursor()
+                        cur.executemany(
+                            "UPDATE orders SET status=?, closed_at=COALESCE(closed_at, ?) WHERE order_id=?",
+                            [("마감", now, oid) for oid in oids],
+                        )
+                        con.commit()
+                    finally:
+                        con.close()
+                    st.success(f"기간 마감 완료: {len(oids)}건")
+                    st.cache_data.clear()
+                    st.rerun()
+        else:
+            st.caption("이 기간에 **마감할 출고 주문**이 없습니다.")
+
+        st.subheader("최근 마감 내역")
+        try:
+            con_r = sqlite3.connect(st.session_state.get("mutomo_db_path", "mutomo.sqlite"))
+            try:
+                recent_closed = pd.read_sql_query(
+                    """
+                    select
+                      closed_at as 마감시각,
+                      shipped_at as 출고시각,
+                      receiver_name as 받는분,
+                      order_id as order_id
+                    from orders
+                    where status = '마감' and closed_at is not null and trim(closed_at) <> ''
+                    order by closed_at desc
+                    limit 30
+                    """,
+                    con_r,
+                )
+            finally:
+                con_r.close()
+            if len(recent_closed):
+                st.dataframe(recent_closed, use_container_width=True, hide_index=True, height=240)
+            else:
+                st.caption("최근 마감 내역이 없습니다.")
+        except Exception:
+            st.caption("마감 내역을 불러오지 못했습니다. 새로고침 후 다시 확인해 주세요.")
+
+        st.subheader("기간 이슈(클레임/취소/메모)")
+        # 기간 내 출고(또는 마감 포함) 중 이슈만
+        has_issue_status = stt.isin({"클레임", "납품취소"})
+        has_memo = pd.Series([False] * len(base), index=base.index)
+        if "special_issue" in base.columns:
+            si = base["special_issue"].astype(str).fillna("").str.strip()
+            has_memo = has_memo | ((si != "") & (si.str.lower() != "nan"))
+        if "attention_note" in base.columns:
+            an = base["attention_note"].astype(str).fillna("").str.strip()
+            has_memo = has_memo | ((an != "") & (an.str.lower() != "nan"))
+        issues = base[has_issue_status | has_memo].copy()
+        st.metric("이슈 건수", int(len(issues)))
+        if len(issues):
+            cols = [c for c in ["_ship_day", "receiver_name", "status", "special_issue", "attention_note", "order_id"] if c in issues.columns]
+            view = issues[cols].copy()
+            view = view.rename(
+                columns={
+                    "_ship_day": "출고일",
+                    "receiver_name": "받는분",
+                    "status": "상태",
+                    "special_issue": "특이사항(수기)",
+                    "attention_note": "특이사항(엑셀)",
+                    "order_id": "order_id",
+                }
+            )
+            for c in ["특이사항(수기)", "특이사항(엑셀)"]:
+                if c in view.columns:
+                    view[c] = view[c].astype(str).fillna("").map(lambda x: (x[:80] + "…") if len(x) > 81 else x)
+            st.dataframe(view, use_container_width=True, hide_index=True, height=300)
+        else:
+            st.caption("이 기간에는 클레임/납품취소/특이사항이 없습니다.")
+
+        with st.expander("마감 리스트(기간 내) 펼쳐보기", expanded=False):
+            if len(already) == 0:
+                st.caption("이 기간에 마감된 주문이 없습니다.")
+            else:
+                max_rows = 2000
+                show_df = already.copy()
+                if len(show_df) > max_rows:
+                    st.caption(f"마감 리스트는 상위 {max_rows:,}건만 표시합니다. (현재 {len(show_df):,}건)")
+                    show_df = show_df.head(max_rows)
+                oids = set(show_df["order_id"].astype(str).tolist()) if "order_id" in show_df.columns else set()
+                amt_map = _calc_order_amount_map(items_all, oids, price_map)
+                show_df["_판매금액"] = show_df["order_id"].astype(str).map(lambda x: amt_map.get(str(x), (0.0, 0.0))[0])
+                show_df["_배송유형"] = show_df["order_id"].astype(str).map(lambda x: _ship_bucket_for_order(items_all, str(x)))
+                cols = [c for c in ["_ship_day", "closed_at", "receiver_name", "_배송유형", "_판매금액", "special_issue", "attention_note", "order_id"] if c in show_df.columns]
+                view = show_df[cols].copy()
+                view = view.rename(
+                    columns={
+                        "_ship_day": "출고일",
+                        "closed_at": "마감시각",
+                        "receiver_name": "받는분",
+                        "_배송유형": "배송",
+                        "_판매금액": "판매금액(단가표)",
+                        "special_issue": "특이사항(수기)",
+                        "attention_note": "특이사항(엑셀)",
+                        "order_id": "order_id",
+                    }
+                )
+                if "판매금액(단가표)" in view.columns:
+                    view["판매금액(단가표)"] = view["판매금액(단가표)"].map(format_won)
+                for c in ["특이사항(수기)", "특이사항(엑셀)"]:
+                    if c in view.columns:
+                        view[c] = view[c].astype(str).fillna("").map(lambda x: (x[:80] + "…") if len(x) > 81 else x)
+                st.dataframe(view, use_container_width=True, hide_index=True, height=420)
 
 
 def main() -> None:
@@ -2190,10 +2619,23 @@ def main() -> None:
     # Settings in sidebar (collapsed)
     with st.sidebar.expander("설정", expanded=False):
         db_path = st.text_input("DB 경로", value="mutomo.sqlite", key="mutomo_db_path")
+        q1, q2, q3 = st.columns(3)
+        with q1:
+            if st.button("전체", key="quick_status_all", help="상태 필터를 전체로"):
+                st.session_state["mutomo_status_filter"] = ["접수", "클레임", "출고", "마감", "납품취소"]
+                st.rerun()
+        with q2:
+            if st.button("마감", key="quick_status_closed", help="마감만 보기"):
+                st.session_state["mutomo_status_filter"] = ["마감"]
+                st.rerun()
+        with q3:
+            if st.button("클레임", key="quick_status_claim", help="클레임만 보기"):
+                st.session_state["mutomo_status_filter"] = ["클레임"]
+                st.rerun()
         status_filter = st.multiselect(
             "상태 필터",
             options=["접수", "클레임", "출고", "마감", "납품취소"],
-            default=["접수", "출고"],
+            default=["접수", "출고", "마감", "클레임"],
             key="mutomo_status_filter",
         )
         date_basis = st.selectbox(
@@ -2245,8 +2687,9 @@ def main() -> None:
         try:
             con0 = sqlite3.connect(db_path)
             try:
+                _lim = int(_RECENT_SOURCE_FILES_SIDEBAR_PREVIEW)
                 recent_files = pd.read_sql_query(
-                    """
+                    f"""
                     select
                       source_file as 파일,
                       count(*) as 주문건수,
@@ -2254,15 +2697,18 @@ def main() -> None:
                     from orders
                     group by source_file
                     order by 마지막수집 desc
-                    limit 12
+                    limit {_lim}
                     """,
                     con0,
                 )
             finally:
                 con0.close()
             if len(recent_files):
-                st.markdown("**최근 수집 파일(최대 12개)**")
-                st.caption("표에는 최대 12개까지 표시되며, 약 5행만 보이고 나머지는 스크롤합니다.")
+                st.markdown(f"**최근 수집 소스 파일** (마지막 수집 시각 기준 **이 표에만** 상위 {_lim}건)")
+                st.caption(
+                    "ingest를 한 달에 한 번이든 매일이든 상관없습니다. DB에는 그대로 쌓이고, "
+                    f"여기는 사이드바 미리보기라 **상위 {_lim}건만** 보여 줍니다. 나머지는 표 안에서 스크롤하세요."
+                )
                 st.dataframe(recent_files, use_container_width=True, hide_index=True, height=220)
         except Exception:
             pass
@@ -2274,7 +2720,7 @@ def main() -> None:
         if "status" in orders_all.columns:
             shipped = orders_all[orders_all["status"] == "출고"].copy()
             if "shipped_at" in shipped.columns:
-                shipped["_d"] = pd.to_datetime(shipped["shipped_at"], errors="coerce").dt.date
+                shipped["_d"] = _shipped_at_calendar_date_series(shipped["shipped_at"])
                 shipped_today_cnt = int((shipped["_d"] == shipped_date).sum())
             else:
                 shipped_today_cnt = len(shipped)
@@ -2282,7 +2728,7 @@ def main() -> None:
         if shipped_today_cnt > 0 and "status" in orders_all.columns:
             shipped_pick = orders_all[orders_all["status"] == "출고"].copy()
             if "shipped_at" in shipped_pick.columns:
-                shipped_pick["_d"] = pd.to_datetime(shipped_pick["shipped_at"], errors="coerce").dt.date
+                shipped_pick["_d"] = _shipped_at_calendar_date_series(shipped_pick["shipped_at"])
                 shipped_pick = shipped_pick[shipped_pick["_d"] == shipped_date]
             _nu, _nt, _nd, _nm = _picking_stats(shipped_pick, items_all)
             st.caption(f"피킹 시트 행: 택배 {_nt}, 직접 {_nd} — 혼합 {_nm}건은 두 시트에 각 1행 (검산 {_nt}+{_nd} = {_nu}+{_nm})")
@@ -2291,7 +2737,7 @@ def main() -> None:
         if shipped_today_cnt > 0 and "status" in orders_all.columns:
             shipped = orders_all[orders_all["status"] == "출고"].copy()
             if "shipped_at" in shipped.columns:
-                shipped["_d"] = pd.to_datetime(shipped["shipped_at"], errors="coerce").dt.date
+                shipped["_d"] = _shipped_at_calendar_date_series(shipped["shipped_at"])
                 shipped = shipped[shipped["_d"] == shipped_date]
             shipped_today_ids = shipped.get("order_id", pd.Series([], dtype=str)).astype(str).tolist()
         shipped_key = f"{shipped_date.isoformat()}|{shipped_today_cnt}|{'/'.join(shipped_today_ids[:200])}"
@@ -2306,6 +2752,153 @@ def main() -> None:
             disabled=(shipped_today_cnt == 0),
             key=f"download_shipped_{export_version}_{shipped_date.isoformat()}_{shipped_today_cnt}",
         )
+
+    with st.sidebar.expander("기간별 마감(청구용)", expanded=False):
+        st.caption("출고일(shipped_at, 한국시간) 기준으로 기간 내 주문을 한 번에 **마감** 처리합니다.")
+        d0, d1 = st.columns(2)
+        with d0:
+            close_d0 = st.date_input("시작일", value=dt.date.today() - dt.timedelta(days=7), key="close_period_d0")
+        with d1:
+            close_d1 = st.date_input("종료일", value=dt.date.today(), key="close_period_d1")
+        if close_d0 > close_d1:
+            st.warning("시작일이 종료일보다 늦습니다.")
+        else:
+            close_statuses = st.multiselect(
+                "대상 상태",
+                options=["출고", "마감", "접수", "클레임", "납품취소"],
+                default=["출고"],
+                key="close_period_statuses",
+                help="보통은 출고만 선택합니다. 이미 마감인 주문을 포함하면 중복 업데이트가 늘어납니다.",
+            )
+            st.caption("※ shipped_at이 없는 주문은 기간 필터에 걸리지 않습니다.")
+            cand = orders_all.copy()
+            if "shipped_at" in cand.columns:
+                cand["_ship_day"] = _shipped_at_calendar_date_series(cand["shipped_at"])
+            else:
+                cand["_ship_day"] = pd.Series([None] * len(cand), index=cand.index, dtype=object)
+            mask = cand["_ship_day"].notna() & (cand["_ship_day"] >= close_d0) & (cand["_ship_day"] <= close_d1)
+            if close_statuses and "status" in cand.columns:
+                mask = mask & cand["status"].astype(str).str.strip().isin(set(close_statuses))
+            cand = cand.loc[mask].copy()
+            n_cand = len(cand)
+            st.metric("마감 대상(건)", n_cand)
+            if n_cand:
+                prev = cand[["shipped_at", "receiver_name", "status", "order_id"]].copy()
+                prev = prev.rename(
+                    columns={"shipped_at": "출고처리시각", "receiver_name": "받는분", "status": "상태", "order_id": "order_id"}
+                )
+                st.dataframe(prev.head(50), use_container_width=True, hide_index=True, height=210)
+                confirm = st.checkbox(
+                    f"{close_d0.isoformat()} ~ {close_d1.isoformat()} 기간의 {n_cand}건을 마감 처리",
+                    value=False,
+                    key="close_period_confirm",
+                )
+                if st.button("기간 마감 실행", type="primary", disabled=(not confirm), key="close_period_run"):
+                    oids = cand["order_id"].astype(str).tolist() if "order_id" in cand.columns else []
+                    if not oids:
+                        st.warning("order_id가 없어 처리할 수 없습니다.")
+                    else:
+                        con = sqlite3.connect(db_path)
+                        try:
+                            cur = con.cursor()
+                            cur.executemany(
+                                "UPDATE orders SET status=?, closed_at=COALESCE(closed_at, ?) WHERE order_id=?",
+                                [("마감", dt.datetime.now().isoformat(timespec="seconds"), oid) for oid in oids],
+                            )
+                            con.commit()
+                        finally:
+                            con.close()
+                        st.success(f"기간 마감 완료: {len(oids)}건")
+                        st.cache_data.clear()
+                        st.rerun()
+            else:
+                st.caption("해당 기간·조건에 맞는 주문이 없습니다.")
+
+    with st.sidebar.expander("최근 마감", expanded=False):
+        st.caption("마감 처리한 시각(`closed_at`) 기준 최근 내역입니다.")
+        try:
+            con_r = sqlite3.connect(db_path)
+            try:
+                recent_closed = pd.read_sql_query(
+                    """
+                    select
+                      closed_at as 마감시각,
+                      shipped_at as 출고시각,
+                      receiver_name as 받는분,
+                      status as 상태,
+                      order_id as order_id
+                    from orders
+                    where status = '마감' and closed_at is not null and trim(closed_at) <> ''
+                    order by closed_at desc
+                    limit 30
+                    """,
+                    con_r,
+                )
+            finally:
+                con_r.close()
+            if len(recent_closed):
+                st.dataframe(recent_closed, use_container_width=True, hide_index=True, height=260)
+            else:
+                st.caption("아직 마감 내역이 없습니다. (방금 마감했다면 새로고침 후 보입니다)")
+        except Exception:
+            st.caption("closed_at 컬럼이 아직 없거나(처음 1회), DB 조회에 실패했습니다. 새로고침 후 다시 확인해 주세요.")
+
+    with st.sidebar.expander("기간 이슈(클레임/취소/메모)", expanded=False):
+        st.caption("청구(마감) 완료 후에는 여기만 보면 됩니다. 기간 내 출고분에서 **문제될 건**만 모아 보여줍니다.")
+        i0, i1 = st.columns(2)
+        with i0:
+            issue_d0 = st.date_input("시작일", value=dt.date.today() - dt.timedelta(days=7), key="issue_period_d0")
+        with i1:
+            issue_d1 = st.date_input("종료일", value=dt.date.today(), key="issue_period_d1")
+        if issue_d0 > issue_d1:
+            st.warning("시작일이 종료일보다 늦습니다.")
+        else:
+            base = orders_all.copy()
+            if "shipped_at" in base.columns:
+                base["_ship_day"] = _shipped_at_calendar_date_series(base["shipped_at"])
+            else:
+                base["_ship_day"] = pd.Series([None] * len(base), index=base.index, dtype=object)
+            # 기간 내 출고분만
+            m = base["_ship_day"].notna() & (base["_ship_day"] >= issue_d0) & (base["_ship_day"] <= issue_d1)
+            if "status" in base.columns:
+                m = m & base["status"].astype(str).str.strip().isin({"출고", "마감", "클레임", "납품취소"})
+            base = base.loc[m].copy()
+
+            if len(base) == 0:
+                st.caption("해당 기간에 출고(shipped_at)된 주문이 없습니다.")
+            else:
+                stt = base["status"].astype(str).str.strip() if "status" in base.columns else pd.Series([""] * len(base))
+                has_issue_status = stt.isin({"클레임", "납품취소"})
+                has_memo = pd.Series([False] * len(base), index=base.index)
+                if "special_issue" in base.columns:
+                    si = base["special_issue"].astype(str).fillna("").str.strip()
+                    has_memo = has_memo | (si != "") & (si.str.lower() != "nan")
+                if "attention_note" in base.columns:
+                    an = base["attention_note"].astype(str).fillna("").str.strip()
+                    has_memo = has_memo | (an != "") & (an.str.lower() != "nan")
+
+                issues = base[has_issue_status | has_memo].copy()
+                st.metric("이슈 건수", int(len(issues)))
+                if len(issues) == 0:
+                    st.caption("클레임/납품취소/메모(특이사항)가 없습니다.")
+                else:
+                    cols = [c for c in ["_ship_day", "receiver_name", "status", "special_issue", "attention_note", "order_id"] if c in issues.columns]
+                    view = issues[cols].copy()
+                    view = view.rename(
+                        columns={
+                            "_ship_day": "출고일",
+                            "receiver_name": "받는분",
+                            "status": "상태",
+                            "special_issue": "특이사항(수기)",
+                            "attention_note": "특이사항(엑셀)",
+                            "order_id": "order_id",
+                        }
+                    )
+                    # 텍스트는 조금만
+                    for c in ["특이사항(수기)", "특이사항(엑셀)"]:
+                        if c in view.columns:
+                            view[c] = view[c].astype(str).fillna("").map(lambda x: (x[:80] + "…") if len(x) > 81 else x)
+                    st.dataframe(view, use_container_width=True, hide_index=True, height=320)
 
     if status_filter:
         orders = orders_all[orders_all["status"].isin(status_filter)]
@@ -2324,7 +2917,8 @@ def main() -> None:
 
     tab_sales, tab_name_search, tab_sales_period = st.tabs(["판매 요약", "이름 검색", "기간별 판매집계"])
     with tab_name_search:
-        render_receiver_name_search(orders, items, db_path, orders_name_hints=orders_all)
+        # 이름 검색은 사이드바 상태 필터와 무관하게 "전체 주문"에서 찾는 게 자연스럽다.
+        render_receiver_name_search(orders_all, items_all, db_path, orders_name_hints=orders_all)
         st.divider()
         st.subheader("전체 접수 목록")
         if len(orders) > 5000:
@@ -2392,7 +2986,7 @@ def main() -> None:
                 if ss == "클레임":
                     return "⚠️ 클레임"
                 if ss == "마감":
-                    return "🧾 마감"
+                    return "🟩✅✅ 마감"
                 if ss == "납품취소":
                     return "⛔ 납품취소"
                 return ss or ""
@@ -2404,8 +2998,8 @@ def main() -> None:
             def _name_emoji(row) -> str:
                 name = "" if row.get("receiver_name") is None else str(row.get("receiver_name")).strip()
                 stt = "" if row.get("status") is None else str(row.get("status")).strip()
-                att_c = _strip_order_list_overlap(row.get("attention_note"), row.get("order_list"))
-                return _compact_name_display(stt, name, att_c or None)
+                # 아이콘은 원본 특이사항(자동)에서 뽑는다. (order_list 중복 제거 결과가 비면 아이콘도 같이 사라질 수 있음)
+                return _compact_name_display(stt, name, row.get("attention_note"))
 
             # Use sorted_orders for original status values
             cols_tmp = [
@@ -2416,7 +3010,9 @@ def main() -> None:
 
         st.caption("행을 선택하면 왼쪽 사이드바에 주문상세가 표시됩니다. 선택을 모두 해제하면 상세가 사라집니다.")
         st.caption("목록에서 행을 고른 뒤 아래 버튼으로 출고·클레임 등 상태를 바꿀 수 있습니다.")
-        tb1, tb2, tb3, tb4, tb5 = st.columns(5)
+        tb0, tb1, tb2, tb3, tb4, tb5 = st.columns([1, 1, 1, 1, 1, 1])
+        with tb0:
+            clear_pick = st.button("선택 해제", key="table_clear_selection_btn", help="표 선택(체크)을 세션에서 초기화합니다.")
         with tb1:
             ship_tbl = st.button("선택 출고", type="primary", key="table_ship_btn")
         with tb2:
@@ -2443,6 +3039,14 @@ def main() -> None:
             name_col_cfg = _cols_cfg
         if "order_id" in sorted_orders.columns:
             _df_sel_key = "mutomo_full_orders_df"
+            if clear_pick:
+                st.session_state["selected_ids_from_table"] = []
+                st.session_state["prev_table_pick_ids"] = []
+                st.session_state["active_selector"] = None
+                st.session_state["table_sync_from_search"] = False
+                if _df_sel_key in st.session_state:
+                    st.session_state[_df_sel_key] = {"selection": {"rows": [], "columns": [], "cells": []}}
+                st.rerun()
             if st.session_state.pop("_search_sync_need_df_apply", False):
                 sync_ids = st.session_state.get("_search_sync_order_ids") or []
                 idset = set(sync_ids)
@@ -2454,6 +3058,38 @@ def main() -> None:
                 st.session_state[_df_sel_key] = {
                     "selection": {"rows": row_idxs, "columns": [], "cells": []},
                 }
+            else:
+                # Streamlit dataframe selection can briefly reset across reruns, or row indices can drift if the
+                # table order changes. Re-align widget row selection with persisted order_ids in `view_orders`.
+                if (
+                    (not st.session_state.get("table_sync_from_search"))
+                    and st.session_state.get("active_selector") == "table"
+                    and "order_id" in view_orders.columns
+                ):
+                    wanted = [str(x) for x in (st.session_state.get("selected_ids_from_table") or []) if str(x)]
+                    if wanted:
+                        want = set(wanted)
+                        row_idxs2: list[int] = []
+                        for i in range(len(view_orders)):
+                            oid = str(view_orders.iloc[i].get("order_id") or "")
+                            if oid in want:
+                                row_idxs2.append(i)
+                        prev_rows: list[int] = []
+                        _prev = st.session_state.get(_df_sel_key)
+                        if isinstance(_prev, dict):
+                            sel = _prev.get("selection") or {}
+                            pr = sel.get("rows")
+                            if isinstance(pr, list):
+                                for x in pr:
+                                    try:
+                                        xi = int(x)
+                                    except (TypeError, ValueError):
+                                        continue
+                                    prev_rows.append(xi)
+                        if prev_rows != row_idxs2:
+                            st.session_state[_df_sel_key] = {
+                                "selection": {"rows": row_idxs2, "columns": [], "cells": []},
+                            }
             try:
                 # Streamlit row selection (supported in recent versions)
                 state = st.dataframe(
@@ -2539,8 +3175,7 @@ def main() -> None:
                 def _disp_name(r: pd.Series) -> str:
                     nm = "" if r.get("receiver_name") is None else str(r.get("receiver_name")).strip()
                     stt = "" if r.get("status") is None else str(r.get("status")).strip()
-                    att_c = _strip_order_list_overlap(r.get("attention_note"), r.get("order_list"))
-                    return _compact_name_display(stt, nm, att_c or None)
+                    return _compact_name_display(stt, nm, r.get("attention_note"))
 
                 df["_이름표시"] = df.apply(_disp_name, axis=1)
                 df = df.rename(columns={"purchase_date": "날짜"})
@@ -2576,17 +3211,23 @@ def main() -> None:
 
             _sales_section_bar()
             st.subheader("최근 출고")
-            ship_base = orders.copy()
+            # "최근 출고"는 사이드바 상태 필터(접수만 보기 등)와 무관하게 항상 출고 건을 보여준다.
+            ship_base = orders_all.copy()
             if "status" in ship_base.columns and len(ship_base):
                 ship_base = ship_base[ship_base["status"].astype(str).str.strip() == "출고"].copy()
             else:
-                ship_base = orders.iloc[:0].copy()
+                ship_base = orders_all.iloc[:0].copy()
             if len(ship_base) and "shipped_at" in ship_base.columns:
-                ship_base["_ship_day"] = pd.to_datetime(ship_base["shipped_at"], errors="coerce").dt.date
+                ship_base["_ship_day"] = _shipped_at_calendar_date_series(ship_base["shipped_at"])
             else:
                 ship_base["_ship_day"] = pd.Series(dtype=object)
+            n_ship_no_time = 0
+            if len(ship_base) and "_ship_day" in ship_base.columns:
+                n_ship_no_time = int(ship_base["_ship_day"].isna().sum())
+            if n_ship_no_time:
+                st.caption(f"⚠️ 출고 {n_ship_no_time}건은 `shipped_at`이 비어 있어 날짜별 패널에서 제외될 수 있습니다. (출고 버튼으로 다시 저장하면 자동 보정됩니다.)")
 
-            def _ship_day_panel(col, day: dt.date) -> None:
+            def _ship_day_panel(col, day: dt.date, idx: int) -> None:
                 if len(ship_base) and "_ship_day" in ship_base.columns:
                     df = ship_base[ship_base["_ship_day"] == day].copy()
                 else:
@@ -2627,7 +3268,8 @@ def main() -> None:
                     if n_ship > 0:
                         st.caption(f"표 **{n_ship}**건")
                 with h_sq:
-                    _sk = f"day_panel_qty_출고_{day.isoformat()}"
+                    # 날짜가 중복될 수 있어(최근 4일 vs 최근 4개 날짜 조합 등) 칸 idx를 포함해 key 유일 보장
+                    _sk = f"day_panel_qty_출고_{day.isoformat()}_{idx}"
                     if _sk not in st.session_state:
                         st.session_state[_sk] = int(n_ship)
                     st.number_input(
@@ -2647,11 +3289,31 @@ def main() -> None:
                     },
                 )
 
-            s1, s2, s3, s4 = st.columns(4)
-            _ship_day_panel(s1, today)
-            _ship_day_panel(s2, today - dt.timedelta(days=1))
-            _ship_day_panel(s3, today - dt.timedelta(days=2))
-            _ship_day_panel(s4, today - dt.timedelta(days=3))
+            # Always show today → 3 days ago (requested UX).
+            days: list[dt.date] = [
+                today,
+                today - dt.timedelta(days=1),
+                today - dt.timedelta(days=2),
+                today - dt.timedelta(days=3),
+            ]
+
+            cols = st.columns(4)
+            for j in range(4):
+                _ship_day_panel(cols[j], days[j], j)
+
+            # shipped_at이 비어 날짜로 묶이지 않는 출고건도 별도로 보여준다
+            if n_ship_no_time and len(ship_base):
+                miss = ship_base[ship_base["_ship_day"].isna()].copy()
+                keep2 = [c for c in ["receiver_name", "order_list", "order_id"] if c in miss.columns]
+                miss = miss[keep2] if keep2 else pd.DataFrame()
+                if "receiver_name" in miss.columns:
+                    miss["받는분"] = miss["receiver_name"].astype(str).str.strip()
+                if "order_list" in miss.columns:
+                    miss["주문"] = miss["order_list"].astype(str).fillna("").map(lambda x: (x[:80] + "…") if len(x) > 81 else x)
+                cols_m = [c for c in ["받는분", "주문", "order_id"] if c in miss.columns]
+                if cols_m:
+                    st.subheader("출고시각 없음(보정 필요)")
+                    st.dataframe(miss[cols_m].head(60), use_container_width=True, hide_index=True, height=240)
 
     with tab_sales_period:
         render_sales_period_tab(orders_all, items_all)
@@ -2668,15 +3330,6 @@ def main() -> None:
             st.session_state["search_pick_ids"] = []
             st.session_state["prev_search_pick_ids"] = []
             st.session_state["request_clear_search_pick_labels"] = True
-    elif (
-        table_selection_supported
-        and not st.session_state.get("table_sync_from_search")
-        and st.session_state.get("active_selector") == "table"
-        and st.session_state.get("selected_ids_from_table")
-    ):
-        st.session_state["selected_ids_from_table"] = []
-        st.session_state["prev_table_pick_ids"] = []
-        st.session_state["active_selector"] = None
 
     selected_ids_persisted = st.session_state.get("selected_ids_from_table", [])
 
@@ -2743,7 +3396,7 @@ def main() -> None:
                 cur = con.cursor()
                 now = dt.datetime.now().isoformat(timespec="seconds")
                 cur.executemany(
-                    "UPDATE orders SET status=?, shipped_at=COALESCE(shipped_at, ?) WHERE order_id=?",
+                    "UPDATE orders SET status=?, shipped_at=COALESCE(NULLIF(shipped_at,''), ?), closed_at=NULL WHERE order_id=?",
                     [("출고", now, oid) for oid in selected_ids_persisted],
                 )
                 con.commit()
@@ -2759,7 +3412,7 @@ def main() -> None:
             try:
                 cur = con.cursor()
                 cur.executemany(
-                    "UPDATE orders SET status=? WHERE order_id=?",
+                    "UPDATE orders SET status=?, closed_at=NULL WHERE order_id=?",
                     [("클레임", oid) for oid in selected_ids_persisted],
                 )
                 con.commit()
@@ -2775,7 +3428,7 @@ def main() -> None:
             try:
                 cur = con.cursor()
                 cur.executemany(
-                    "UPDATE orders SET status=?, shipped_at=NULL WHERE order_id=?",
+                    "UPDATE orders SET status=?, shipped_at=NULL, closed_at=NULL WHERE order_id=?",
                     [("접수", oid) for oid in selected_ids_persisted],
                 )
                 con.commit()
@@ -2791,8 +3444,8 @@ def main() -> None:
             try:
                 cur = con.cursor()
                 cur.executemany(
-                    "UPDATE orders SET status=? WHERE order_id=?",
-                    [("마감", oid) for oid in selected_ids_persisted],
+                    "UPDATE orders SET status=?, closed_at=COALESCE(closed_at, ?) WHERE order_id=?",
+                    [("마감", dt.datetime.now().isoformat(timespec="seconds"), oid) for oid in selected_ids_persisted],
                 )
                 con.commit()
             finally:
@@ -2807,7 +3460,7 @@ def main() -> None:
             try:
                 cur = con.cursor()
                 cur.executemany(
-                    "UPDATE orders SET status=? WHERE order_id=?",
+                    "UPDATE orders SET status=?, closed_at=NULL WHERE order_id=?",
                     [("납품취소", oid) for oid in selected_ids_persisted],
                 )
                 con.commit()

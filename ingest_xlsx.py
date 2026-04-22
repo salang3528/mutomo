@@ -15,6 +15,7 @@ import yaml
 from rapidfuzz import fuzz, process
 
 from recipient_identity import assign_recipient_ids
+from openpyxl.utils.datetime import from_excel as _excel_serial_to_datetime
 
 
 EXPECTED_COLS = 13  # current vendor sheet has 13 columns (incl. address/phone/request)
@@ -79,6 +80,76 @@ def purchase_date_from_filename(source_file: str) -> str | None:
         return dt.date(yyyy, mm, dd).isoformat()
     except Exception:
         return None
+
+
+def parse_purchase_date_from_sheet(raw: object, source_file: str | None = None) -> str | None:
+    """
+    엑셀의 '주문일자' 셀 값을 ISO 날짜(YYYY-MM-DD)로 변환합니다.
+    파일명(YYMMDD)보다 우선해서 접수일자를 날짜별로 정확히 구분하기 위함입니다.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dt.datetime):
+        try:
+            return raw.date().isoformat()
+        except Exception:
+            return None
+    if isinstance(raw, dt.date):
+        return raw.isoformat()
+
+    s = str(raw).strip()
+    if not s or s.lower() in ("none", "nan", "-", "#n/a"):
+        return None
+
+    # "2026-04-16 00:00:00" / "2026-04-16"
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        try:
+            return dt.date.fromisoformat(s[:10]).isoformat()
+        except ValueError:
+            pass
+
+    # "4.19" / "4/19" 같은 형태 (대부분 주문서에서 사용하는 월.일)
+    m = re.fullmatch(r"(?P<m>\d{1,2})\s*[./-]\s*(?P<d>\d{1,2})", s)
+    if m:
+        mm = int(m.group("m"))
+        dd = int(m.group("d"))
+        # 연도는 파일명 YYMMDD에서 추정. (없으면 올해)
+        base_iso = purchase_date_from_filename(source_file or "") if source_file else None
+        base = None
+        try:
+            base = dt.date.fromisoformat(base_iso) if base_iso else None
+        except Exception:
+            base = None
+        yyyy = (base.year if base else dt.date.today().year)
+        # 12월 주문이 4월 파일에 섞이는 케이스 등: base 월보다 크게 멀면 작년으로 간주
+        if base and (mm - base.month) >= 6:
+            yyyy = base.year - 1
+        try:
+            return dt.date(yyyy, mm, dd).isoformat()
+        except Exception:
+            return None
+
+    ts = pd.to_datetime(s, errors="coerce", dayfirst=False)
+    if not pd.isna(ts):
+        try:
+            return ts.date().isoformat()
+        except Exception:
+            pass
+
+    # 숫자만(엑셀 날짜 직렬값) — openpyxl data_only 시 datetime이 아닌 경우
+    if re.fullmatch(r"\d{5,6}", s):
+        try:
+            n = float(s)
+            if 30000 <= n <= 80000:
+                d = _excel_serial_to_datetime(n)
+                if isinstance(d, dt.datetime):
+                    return d.date().isoformat()
+                if isinstance(d, dt.date):
+                    return d.isoformat()
+        except Exception:
+            pass
+
+    return None
 
 
 def extract_size(text: str | None) -> str | None:
@@ -534,6 +605,7 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
         start = it.group_start_row if it.group_start_row is not None else it.row_idx
         order_id = f"{it.source_file}#{it.group_no}@{start}"
         if order_id not in order_rows:
+            sheet_p = parse_purchase_date_from_sheet(it.order_date_raw, it.source_file)
             order_rows[order_id] = {
                 "order_id": order_id,
                 "source_file": it.source_file,
@@ -541,8 +613,8 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
                 "group_start_row": it.group_start_row,
                 "deadline_raw": it.deadline_raw,
                 "order_date_raw": it.order_date_raw,
-                # 구매일자: 파일명에서 추출 (예: 260401-.. -> 2026-04-01)
-                "purchase_date": purchase_date_from_filename(it.source_file),
+                # 구매일자: 엑셀 주문일자 우선, 없으면 파일명 YYMMDD (예: 260401-.. -> 2026-04-01)
+                "purchase_date": sheet_p or purchase_date_from_filename(it.source_file),
                 # 주문자(받는사람) / 배송 정보: 이 엑셀(3열, 11~13열)에서 추출
                 "receiver_name": it.receiver_name_raw,
                 "address": it.address_raw,
@@ -562,6 +634,9 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
         else:
             # Fill missing order-level fields if later rows contain them
             o = order_rows[order_id]
+            sheet_p = parse_purchase_date_from_sheet(it.order_date_raw, it.source_file)
+            if sheet_p:
+                o["purchase_date"] = sheet_p
             for k, v in [
                 ("receiver_name", it.receiver_name_raw),
                 ("address", it.address_raw),
@@ -706,7 +781,6 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
 
 
 ORDER_EDITABLE_COLS = {
-    "purchase_date",
     "receiver_name",
     "address",
     "phone",
@@ -715,6 +789,8 @@ ORDER_EDITABLE_COLS = {
     "special_issue",
     "status",
     "shipped_at",
+    # 대시보드에서 기록하는 마감 시각 — 재수집 시 incoming에 없으므로 반드시 보존
+    "closed_at",
 }
 
 
