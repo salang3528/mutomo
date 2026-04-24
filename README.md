@@ -76,6 +76,10 @@ python -m streamlit run dashboard.py
 
 - 주문서 본문 어디에든 **`도면참조` / `도면참고`** 문구가 있으면(공백·줄바꿈 무시) 이름 뒤에 **📐** 아이콘이 붙습니다.
 
+### 옵션 추가금(예: 다리높이) 단가 반영
+
+- 품목 텍스트에 **`(+16000원)`** 같은 표기가 있으면 단가표의 **판매가격/광진가격**에 자동으로 더해서 집계합니다.
+
 ---
 
 ## 회사·다른 PC에서 이어서 작업
@@ -105,6 +109,17 @@ python -m streamlit run dashboard.py
 수집된 품목명(`product_raw` / `product_canonical`)과 **ingest와 동일한 정규화 키**로 매칭해, **기간별 판매집계** 탭에서만 합계 금액에 반영합니다(단가 행을 대시보드에 뿌리지는 않습니다).
 
 > 민감하거나 자주 바뀌는 경우 Git에 포함하지 않고 PC에만 두고 싶다면 `.gitignore`에 `단가표.csv`를 추가하면 됩니다.
+
+### 웹 단가표(브랜드/이미지 포함) 만들기
+
+`mu-tomo.com`의 `ALL PRODUCTS` 목록에서 **상품명/가격/썸네일**을 뽑아 CSV로 정리할 수 있습니다.
+
+```powershell
+python tools\crawl_mutomo_prices.py --out 단가표_from_web_detailed.csv
+```
+
+- 결과에는 `brand`(예: `TAKT`, `mono`, `MUTOMO` 등)와 `image_url`, `url`이 포함되어 있어서 **우리 제품만 남기고 삭제**하기 쉽습니다.
+- 정리 후에는 `엑셀상품명/판매가격/광진가격(60%)` 열만 남겨 `단가표.csv`로 저장하면 대시보드 집계에 바로 반영됩니다.
 
 ---
 

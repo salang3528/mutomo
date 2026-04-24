@@ -22,7 +22,7 @@ from ingest_xlsx import (
     sheet_contains_drawing_ref_keyword,
     shelf_color_from_note_raw_cell,
 )
-from pricing import format_won, load_unit_prices, lookup_line_price
+from pricing import format_won, line_unit_prices, load_unit_prices, lookup_line_price
 from recipient_identity import assign_recipient_ids
 from sales_period_agg import summarize_sales_period
 
@@ -189,6 +189,13 @@ def _drawing_ref_sheet_blob(row: pd.Series, items_df: pd.DataFrame | None) -> st
         if key in row.index:
             parts.append(str(row.get(key) or ""))
     return "\n".join(parts)
+
+
+def _is_drawing_ref_order_row(row: pd.Series, items_df: pd.DataFrame | None) -> bool:
+    try:
+        return sheet_contains_drawing_ref_keyword(_drawing_ref_sheet_blob(row, items_df))
+    except Exception:
+        return False
 
 
 def _compact_name_display(
@@ -500,15 +507,100 @@ def _ensure_settlements_table(db_path: str) -> None:
         con.close()
 
 
+def _ensure_order_amount_overrides_table(db_path: str) -> None:
+    """Manual per-order amount overrides (for custom/drawing reference orders)."""
+    con = sqlite3.connect(db_path)
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_amount_overrides (
+              order_id     TEXT PRIMARY KEY,
+              sale_amount  REAL DEFAULT 0,
+              gj_amount    REAL DEFAULT 0,
+              note         TEXT,
+              updated_at   TEXT
+            )
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _load_order_amount_overrides(db_path: str, order_ids: set[str]) -> dict[str, tuple[float, float]]:
+    """Return order_id -> (sale_amount, gj_amount) for orders with overrides."""
+    out: dict[str, tuple[float, float]] = {}
+    if not order_ids:
+        return out
+    _ensure_order_amount_overrides_table(db_path)
+    con = sqlite3.connect(db_path)
+    try:
+        cur = con.cursor()
+        ids = [str(x) for x in order_ids if str(x)]
+        # SQLite variable limit is high enough for our use; chunk defensively anyway.
+        chunk = 450
+        for i in range(0, len(ids), chunk):
+            sub = ids[i : i + chunk]
+            qmarks = ",".join(["?"] * len(sub))
+            cur.execute(
+                f"SELECT order_id, sale_amount, gj_amount FROM order_amount_overrides WHERE order_id IN ({qmarks})",
+                sub,
+            )
+            for oid, sale, gj in cur.fetchall():
+                try:
+                    out[str(oid)] = (float(sale or 0.0), float(gj or 0.0))
+                except Exception:
+                    out[str(oid)] = (0.0, 0.0)
+    finally:
+        con.close()
+    return out
+
+
+def _upsert_order_amount_override(db_path: str, order_id: str, sale_amount: float, gj_amount: float, note: str = "") -> None:
+    _ensure_order_amount_overrides_table(db_path)
+    con = sqlite3.connect(db_path)
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO order_amount_overrides(order_id, sale_amount, gj_amount, note, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(order_id) DO UPDATE SET
+              sale_amount=excluded.sale_amount,
+              gj_amount=excluded.gj_amount,
+              note=excluded.note,
+              updated_at=excluded.updated_at
+            """,
+            (
+                str(order_id),
+                float(sale_amount or 0.0),
+                float(gj_amount or 0.0),
+                str(note or ""),
+                dt.datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 def _calc_amounts_for_orders(
-    items_df: pd.DataFrame, order_ids: set[str], price_map: dict
+    items_df: pd.DataFrame, order_ids: set[str], price_map: dict, overrides: dict[str, tuple[float, float]] | None = None
 ) -> tuple[float, float, int, int]:
     """Return (sale_amount, gwangjin_amount, n_unpriced_lines, unpriced_qty) for given orders."""
-    if not order_ids or items_df is None or len(items_df) == 0 or "order_id" not in items_df.columns:
+    if not order_ids:
         return 0.0, 0.0, 0, 0
-    it = items_df[items_df["order_id"].astype(str).isin(order_ids)].copy()
+    ov = overrides or {}
+    ov_keys = set(ov.keys())
+    remaining = set(order_ids) - ov_keys
+    base_sale = float(sum(ov.get(oid, (0.0, 0.0))[0] for oid in ov_keys))
+    base_gj = float(sum(ov.get(oid, (0.0, 0.0))[1] for oid in ov_keys))
+    if items_df is None or len(items_df) == 0 or "order_id" not in items_df.columns or not remaining:
+        return base_sale, base_gj, 0, 0
+    it = items_df[items_df["order_id"].astype(str).isin(remaining)].copy()
     if len(it) == 0:
-        return 0.0, 0.0, 0, 0
+        return base_sale, base_gj, 0, 0
     q = pd.to_numeric(it.get("qty"), errors="coerce").fillna(0).astype(int).clip(lower=0)
     it["_q"] = q
     sale_amount = 0.0
@@ -517,30 +609,40 @@ def _calc_amounts_for_orders(
     unpriced_qty = 0
     for _, r in it.iterrows():
         qty_i = int(r.get("_q") or 0)
-        pr = lookup_line_price(r, price_map) if price_map else None
-        if pr is None:
+        pu = line_unit_prices(r, price_map) if price_map else None
+        if pu is None:
             n_unpriced += 1
             unpriced_qty += qty_i
             continue
         try:
-            sale_amount += float(pr.get("판매가격") or 0) * qty_i
+            sale_amount += float(pu[0] or 0.0) * qty_i
         except (TypeError, ValueError):
             pass
-        gj_v = pr.get("광진가격(60%)")
         try:
-            if gj_v is not None and not (isinstance(gj_v, float) and pd.isna(gj_v)):
-                gj_amount += float(gj_v) * qty_i
+            gj_amount += float(pu[1] or 0.0) * qty_i
         except (TypeError, ValueError):
             pass
-    return float(sale_amount), float(gj_amount), int(n_unpriced), int(unpriced_qty)
+    return float(base_sale + sale_amount), float(base_gj + gj_amount), int(n_unpriced), int(unpriced_qty)
 
 
-def _calc_order_amount_map(items_df: pd.DataFrame, order_ids: set[str], price_map: dict) -> dict[str, tuple[float, float]]:
+def _calc_order_amount_map(
+    items_df: pd.DataFrame,
+    order_ids: set[str],
+    price_map: dict,
+    overrides: dict[str, tuple[float, float]] | None = None,
+) -> dict[str, tuple[float, float]]:
     """order_id -> (sale_amount, gwangjin_amount) using 단가표. Missing prices contribute 0."""
     out: dict[str, tuple[float, float]] = {}
-    if not order_ids or items_df is None or len(items_df) == 0 or "order_id" not in items_df.columns:
+    if not order_ids:
         return out
-    it = items_df[items_df["order_id"].astype(str).isin(order_ids)].copy()
+    ov = overrides or {}
+    for oid, (sa, gj) in ov.items():
+        if oid in order_ids:
+            out[str(oid)] = (float(sa or 0.0), float(gj or 0.0))
+    remaining = set(order_ids) - set(out.keys())
+    if not remaining or items_df is None or len(items_df) == 0 or "order_id" not in items_df.columns:
+        return out
+    it = items_df[items_df["order_id"].astype(str).isin(remaining)].copy()
     if len(it) == 0:
         return out
     it["_oid"] = it["order_id"].astype(str)
@@ -552,20 +654,18 @@ def _calc_order_amount_map(items_df: pd.DataFrame, order_ids: set[str], price_ma
         if not oid:
             continue
         q = int(r.get("_q") or 0)
-        pr = lookup_line_price(r, price_map) if price_map else None
-        if pr is None or q <= 0:
+        pu = line_unit_prices(r, price_map) if price_map else None
+        if pu is None or q <= 0:
             continue
         try:
-            acc_sale[oid] = acc_sale.get(oid, 0.0) + float(pr.get("판매가격") or 0) * q
+            acc_sale[oid] = acc_sale.get(oid, 0.0) + float(pu[0] or 0.0) * q
         except (TypeError, ValueError):
             pass
-        gj_v = pr.get("광진가격(60%)")
         try:
-            if gj_v is not None and not (isinstance(gj_v, float) and pd.isna(gj_v)):
-                acc_gj[oid] = acc_gj.get(oid, 0.0) + float(gj_v) * q
+            acc_gj[oid] = acc_gj.get(oid, 0.0) + float(pu[1] or 0.0) * q
         except (TypeError, ValueError):
             pass
-    for oid in order_ids:
+    for oid in remaining:
         out[str(oid)] = (float(acc_sale.get(str(oid), 0.0)), float(acc_gj.get(str(oid), 0.0)))
     return out
 
@@ -2234,6 +2334,10 @@ def render_receiver_name_search(
     with rc5:
         cancel_action = st.button("납품취소", key="status_cancel")
 
+    # 도면참조/도면참고 주문은 출고 시 금액(단가) 수기 입력을 지원한다.
+    if "mutomo_pending_ship_with_price" not in st.session_state:
+        st.session_state["mutomo_pending_ship_with_price"] = None
+
     if ship_action and pick_ids:
         sub = orders[orders["order_id"].astype(str).isin([str(x) for x in pick_ids])]
         if "status" not in sub.columns:
@@ -2248,6 +2352,21 @@ def render_receiver_name_search(
                 "미출고(접수·도면참조·클레임 등) 주문만 골라 주세요."
             )
         else:
+            # drawing-ref 여부 판단(전체 주문 + 품목까지 포함)
+            draw_ids: list[str] = []
+            if "order_id" in orders_all.columns and pending_ship:
+                sub_all = orders_all[orders_all["order_id"].astype(str).isin([str(x) for x in pending_ship])].copy()
+                for _, rr in sub_all.iterrows():
+                    if _is_drawing_ref_order_row(rr, items):
+                        draw_ids.append(str(rr.get("order_id") or "").strip())
+
+            if draw_ids:
+                st.session_state["mutomo_pending_ship_with_price"] = {
+                    "ids": pending_ship,
+                    "draw_ids": draw_ids,
+                }
+                st.rerun()
+
             if already_shipped:
                 st.info(f"이미 출고 {len(already_shipped)}건은 건너뛰고, **{len(pending_ship)}건**만 출고 처리합니다.")
             con = sqlite3.connect(db_path)
@@ -2264,6 +2383,77 @@ def render_receiver_name_search(
             st.success("출고 처리했습니다.")
             st.cache_data.clear()
             st.rerun()
+
+    pend_ship = st.session_state.get("mutomo_pending_ship_with_price")
+    if isinstance(pend_ship, dict):
+        p_ids = [str(x) for x in (pend_ship.get("ids") or []) if str(x)]
+        draw_ids = [str(x) for x in (pend_ship.get("draw_ids") or []) if str(x)]
+        if p_ids and draw_ids:
+            st.warning("도면참고/도면참조 주문이 포함되어 **출고 시 금액(단가) 입력**이 필요합니다.")
+            sub_all = orders_all[orders_all["order_id"].astype(str).isin(p_ids)].copy() if "order_id" in orders_all.columns else pd.DataFrame()
+            overrides = _load_order_amount_overrides(db_path, set(draw_ids))
+            with st.form("ship_drawing_ref_price_form", clear_on_submit=False):
+                st.caption("도면참고/도면참조 주문만 입력합니다. (원하면 0으로 둘 수도 있습니다.)")
+                for oid in draw_ids:
+                    row = sub_all[sub_all["order_id"].astype(str) == oid].head(1)
+                    nm = ""
+                    if len(row) and "receiver_name" in row.columns:
+                        nm = str(row.iloc[0].get("receiver_name") or "").strip()
+                    prev_sale, prev_gj = overrides.get(oid, (0.0, 0.0))
+                    c1, c2, c3 = st.columns([2.5, 1.2, 1.2])
+                    with c1:
+                        st.markdown(f"**{nm or '(이름없음)'}**  \n`{oid}`")
+                    with c2:
+                        st.number_input(
+                            "판매금액(총)",
+                            min_value=0.0,
+                            step=1000.0,
+                            value=float(prev_sale),
+                            key=f"ship_override_sale_{oid}",
+                        )
+                    with c3:
+                        st.number_input(
+                            "광진금액(총)",
+                            min_value=0.0,
+                            step=1000.0,
+                            value=float(prev_gj),
+                            key=f"ship_override_gj_{oid}",
+                        )
+                    st.text_input("메모", value="", key=f"ship_override_note_{oid}", placeholder="예: 도면참고 수기 단가")
+                    st.divider()
+
+                c_can, c_ok = st.columns(2)
+                with c_can:
+                    cancel = st.form_submit_button("취소", type="secondary")
+                with c_ok:
+                    submit = st.form_submit_button("입력 후 출고 처리", type="primary")
+
+            if cancel:
+                st.session_state["mutomo_pending_ship_with_price"] = None
+                st.rerun()
+            if submit:
+                # save overrides for draw ids
+                for oid in draw_ids:
+                    sale_v = float(st.session_state.get(f"ship_override_sale_{oid}") or 0.0)
+                    gj_v = float(st.session_state.get(f"ship_override_gj_{oid}") or 0.0)
+                    note_v = str(st.session_state.get(f"ship_override_note_{oid}") or "").strip()
+                    _upsert_order_amount_override(db_path, oid, sale_v, gj_v, note_v)
+
+                con = sqlite3.connect(db_path)
+                try:
+                    cur = con.cursor()
+                    now = dt.datetime.now().isoformat(timespec="seconds")
+                    cur.executemany(
+                        "UPDATE orders SET status=?, shipped_at=COALESCE(NULLIF(shipped_at,''), ?), closed_at=NULL WHERE order_id=?",
+                        [("출고", now, oid) for oid in p_ids],
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+                st.session_state["mutomo_pending_ship_with_price"] = None
+                st.success("금액 저장 후 출고 처리했습니다.")
+                st.cache_data.clear()
+                st.rerun()
 
     if claim_action and pick_ids:
         con = sqlite3.connect(db_path)
@@ -2496,15 +2686,20 @@ def render_sales_period_tab(orders_all: pd.DataFrame, items_all: pd.DataFrame) -
         # 금액 요약 (단가표 기준)
         closed_ids = set(already["order_id"].astype(str).tolist()) if "order_id" in already.columns else set()
         cand_ids = set(cand["order_id"].astype(str).tolist()) if "order_id" in cand.columns else set()
-        closed_sale, closed_gj, closed_unp_lines, closed_unp_qty = _calc_amounts_for_orders(items_all, closed_ids, price_map)
-        cand_sale, cand_gj, cand_unp_lines, cand_unp_qty = _calc_amounts_for_orders(items_all, cand_ids, price_map)
+        ov = _load_order_amount_overrides(db_path, set(closed_ids) | set(cand_ids))
+        closed_sale, closed_gj, closed_unp_lines, closed_unp_qty = _calc_amounts_for_orders(
+            items_all, closed_ids, price_map, overrides=ov
+        )
+        cand_sale, cand_gj, cand_unp_lines, cand_unp_qty = _calc_amounts_for_orders(
+            items_all, cand_ids, price_map, overrides=ov
+        )
 
         # 배송 유형(택배/직접/혼합)별 금액/건수
         def _bucket_sums(order_ids: set[str]) -> dict[str, dict[str, float | int]]:
             d: dict[str, dict[str, float | int]] = {k: {"n": 0, "sale": 0.0, "gj": 0.0} for k in ("택배", "직접", "혼합")}
             if not order_ids:
                 return d
-            amt = _calc_order_amount_map(items_all, order_ids, price_map)
+            amt = _calc_order_amount_map(items_all, order_ids, price_map, overrides=ov)
             for oid in order_ids:
                 b = _ship_bucket_for_order(items_all, str(oid))
                 sale, gj = amt.get(str(oid), (0.0, 0.0))
@@ -2720,7 +2915,7 @@ def render_sales_period_tab(orders_all: pd.DataFrame, items_all: pd.DataFrame) -
                     st.caption(f"마감 리스트는 상위 {max_rows:,}건만 표시합니다. (현재 {len(show_df):,}건)")
                     show_df = show_df.head(max_rows)
                 oids = set(show_df["order_id"].astype(str).tolist()) if "order_id" in show_df.columns else set()
-                amt_map = _calc_order_amount_map(items_all, oids, price_map)
+                amt_map = _calc_order_amount_map(items_all, oids, price_map, overrides=ov)
                 show_df["_판매금액"] = show_df["order_id"].astype(str).map(lambda x: amt_map.get(str(x), (0.0, 0.0))[0])
                 show_df["_배송유형"] = show_df["order_id"].astype(str).map(lambda x: _ship_bucket_for_order(items_all, str(x)))
                 cols = [c for c in ["_ship_day", "closed_at", "receiver_name", "_배송유형", "_판매금액", "special_issue", "attention_note", "order_id"] if c in show_df.columns]
@@ -3156,10 +3351,24 @@ def main() -> None:
         "created_at",
     ]
     all_cols = user_cols + (admin_cols if show_admin_cols else [])
-    sort_cols_all = [c for c in ["source_file", "group_no"] if c in orders.columns]
-    sorted_orders = orders.drop(columns=["_date"], errors="ignore")
-    if sort_cols_all:
-        sorted_orders = sorted_orders.sort_values(sort_cols_all, na_position="last")
+    # 전체 접수 목록은 "최근 날짜가 위"로 정렬 (원본 엑셀 파일명 순이 아니라 업무 흐름 기준)
+    sorted_orders = orders.copy()
+    sort_cols: list[str] = []
+    ascending: list[bool] = []
+    if "_date" in sorted_orders.columns:
+        sort_cols.append("_date")
+        ascending.append(False)
+    if "created_at" in sorted_orders.columns:
+        sort_cols.append("created_at")
+        ascending.append(False)
+    # 동률일 때는 파일/그룹 순으로 안정적으로
+    for c in ["source_file", "group_no"]:
+        if c in sorted_orders.columns:
+            sort_cols.append(c)
+            ascending.append(True)
+    if sort_cols:
+        sorted_orders = sorted_orders.sort_values(sort_cols, ascending=ascending, na_position="last")
+    sorted_orders = sorted_orders.drop(columns=["_date"], errors="ignore")
     if "order_id" in sorted_orders.columns and len(items_all) and "order_id" in items_all.columns:
         _ship_map = infer_settlement_ship_series(items_all)
         sorted_orders = sorted_orders.copy()
@@ -3498,19 +3707,8 @@ def main() -> None:
                 h_date, h_qty = col.columns([5, 2])
                 with h_date:
                     st.markdown(f"**{day.isoformat()}**")
-                    if n_actual > 0:
-                        st.caption(f"표 **{n_actual}**건")
                 with h_qty:
-                    _qk = f"day_panel_qty_접수_{day.isoformat()}"
-                    if _qk not in st.session_state:
-                        st.session_state[_qk] = int(n_actual)
-                    st.number_input(
-                        "수량",
-                        min_value=0,
-                        step=1,
-                        key=_qk,
-                        help="아래 표 건수와 **다르게** 둘 수 있습니다(현장 메모·목표 등). 브라우저 세션에만 저장됩니다.",
-                    )
+                    st.markdown(f"**수량 {n_actual}**")
                 col.dataframe(
                     df,
                     use_container_width=True,
@@ -3608,20 +3806,8 @@ def main() -> None:
                 h_sd, h_sq = col.columns([5, 2])
                 with h_sd:
                     st.markdown(f"**{day.isoformat()}**")
-                    if n_ship > 0:
-                        st.caption(f"표 **{n_ship}**건")
                 with h_sq:
-                    # 날짜가 중복될 수 있어(최근 4일 vs 최근 4개 날짜 조합 등) 칸 idx를 포함해 key 유일 보장
-                    _sk = f"day_panel_qty_출고_{day.isoformat()}_{idx}"
-                    if _sk not in st.session_state:
-                        st.session_state[_sk] = int(n_ship)
-                    st.number_input(
-                        "수량",
-                        min_value=0,
-                        step=1,
-                        key=_sk,
-                        help="아래 표 건수와 **다르게** 둘 수 있습니다(현장 메모·목표 등). 브라우저 세션에만 저장됩니다.",
-                    )
+                    st.markdown(f"**수량 {n_ship}**")
                 col.dataframe(
                     df,
                     use_container_width=True,

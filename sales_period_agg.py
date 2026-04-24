@@ -9,7 +9,7 @@ import pandas as pd
 
 from ingest_xlsx import _product_key as _row_product_key
 
-from pricing import lookup_line_price
+from pricing import line_unit_prices, lookup_line_price
 
 
 def _to_date_series(s: pd.Series) -> pd.Series:
@@ -112,23 +112,22 @@ def summarize_sales_period(
 
     for _, r in it.iterrows():
         q = int(r["_q"])
-        pr = lookup_line_price(r, price_map) if price_map else None
+        pu = line_unit_prices(r, price_map) if price_map else None
         name = _display_name(r)
         pk_cell = str(r.get("product_key") or "").strip()
         key = pk_cell or _row_product_key(name)
 
-        if pr is None:
+        if pu is None:
             n_unpriced_lines += 1
             unpriced_qty += q
             sale = gj = 0.0
         else:
             try:
-                sale = float(pr.get("판매가격") or 0) * q
+                sale = float(pu[0] or 0.0) * q
             except (TypeError, ValueError):
                 sale = 0.0
-            gj_v = pr.get("광진가격(60%)")
             try:
-                gj = float(gj_v) * q if gj_v is not None and not (isinstance(gj_v, float) and pd.isna(gj_v)) else 0.0
+                gj = float(pu[1] or 0.0) * q
             except (TypeError, ValueError):
                 gj = 0.0
 
@@ -140,7 +139,7 @@ def summarize_sales_period(
         acc["판매금액"] += sale
         acc["광진금액"] += gj
         acc["라인수"] += 1
-        if pr is None:
+        if pu is None:
             acc["단가미매칭수량"] += q
 
     by_product = (

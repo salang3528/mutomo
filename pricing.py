@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import pandas as pd
@@ -80,6 +81,68 @@ def lookup_line_price(item_row: pd.Series, price_map: dict[str, dict[str, Any]])
         if hit:
             return hit
     return None
+
+
+_WON_SURCHARGE_RE = re.compile(r"\(\s*\+?\s*(?P<num>[\d,]+)\s*원\s*\)")
+
+
+def option_surcharge_won(item_row: pd.Series) -> int:
+    """품목 옵션 텍스트에 포함된 '(+16000원)' 같은 추가금(원)을 추출.
+
+    예: '43cm (+16000원)' → 16000
+    여러 개면 합산.
+    """
+    parts: list[str] = []
+    for c in ("spec_raw", "note_raw", "product_raw", "product_canonical"):
+        v = item_row.get(c)
+        if v is None:
+            continue
+        try:
+            if pd.isna(v):
+                continue
+        except Exception:
+            pass
+        s = str(v).strip()
+        if s:
+            parts.append(s)
+    if not parts:
+        return 0
+    text = "\n".join(parts)
+    total = 0
+    for m in _WON_SURCHARGE_RE.finditer(text):
+        raw = (m.group("num") or "").replace(",", "").strip()
+        if not raw:
+            continue
+        try:
+            total += int(raw)
+        except ValueError:
+            continue
+    return int(total)
+
+
+def line_unit_prices(item_row: pd.Series, price_map: dict[str, dict[str, Any]]) -> tuple[float, float] | None:
+    """단가표 기준 1개 단가(판매/광진). 옵션 추가금(+원)이 있으면 판매는 그대로 더하고,
+    광진은 60%로 환산해서 더한다(광진열이 없으면 0).
+    """
+    pr = lookup_line_price(item_row, price_map) if price_map else None
+    if pr is None:
+        return None
+    try:
+        sale = float(pr.get("판매가격") or 0.0)
+    except (TypeError, ValueError):
+        sale = 0.0
+    gj_v = pr.get("광진가격(60%)")
+    try:
+        gj = float(gj_v) if gj_v is not None and not (isinstance(gj_v, float) and pd.isna(gj_v)) else 0.0
+    except (TypeError, ValueError):
+        gj = 0.0
+
+    add = option_surcharge_won(item_row)
+    if add:
+        sale += float(add)
+        # 광진금액은 기본 60% 정책을 따르되, 반올림해서 원 단위로 맞춘다.
+        gj += float(int(round(float(add) * 0.6)))
+    return float(sale), float(gj)
 
 
 def format_won(v: object) -> str:
