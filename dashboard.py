@@ -13,7 +13,15 @@ import streamlit as st
 import streamlit.components.v1 as st_components
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
-from ingest_xlsx import classify_ship_raw, infer_settlement_ship_series
+from ingest_xlsx import (
+    apply_drawing_ref_status_from_sheet,
+    classify_ship_raw,
+    infer_settlement_ship_series,
+    order_sheet_blob_for_drawing_ref,
+    run_ingest,
+    sheet_contains_drawing_ref_keyword,
+    shelf_color_from_note_raw_cell,
+)
 from pricing import format_won, load_unit_prices, lookup_line_price
 from recipient_identity import assign_recipient_ids
 from sales_period_agg import summarize_sales_period
@@ -61,7 +69,7 @@ def _status_lead_icon(status: str) -> str:
     if s == "클레임":
         return "⚠️ "
     if s == "마감":
-        return "🧾 "
+        return "💰 "
     if s == "납품취소":
         return "⛔ "
     return ""
@@ -133,6 +141,26 @@ def _attention_note_export_for_order(att_v: object, order_list_v: object) -> str
     return _attention_note_with_icon_export(cleaned or None)
 
 
+def _combined_attention_for_icons(attention_note_val: object, special_issue_val: object) -> object:
+    """이름 옆 아이콘용: 엑셀 특이사항(자동) + 수기 이슈를 함께 본다(본문 열과는 별개)."""
+    parts: list[str] = []
+    for v in (attention_note_val, special_issue_val):
+        if v is None:
+            continue
+        try:
+            if pd.isna(v):
+                continue
+        except Exception:
+            pass
+        s = str(v).strip()
+        if not s or s.lower() in ("nan", "none", "-", "#n/a"):
+            continue
+        parts.append(s)
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
 def _trailing_icon_segment(has_attention: bool, note_text: str, max_icons: int = 3) -> str:
     """Up to max_icons after the name: 🟥 first if present, then note-derived icons."""
     seq: list[str] = []
@@ -152,12 +180,30 @@ def _trailing_icon_segment(has_attention: bool, note_text: str, max_icons: int =
     return (" " + " ".join(out)) if out else ""
 
 
-def _compact_name_display(status: str, receiver_name: str, attention_note_val: object) -> str:
+def _drawing_ref_sheet_blob(row: pd.Series, items_df: pd.DataFrame | None) -> str:
+    """배송요청·품목줄 등 주문서 전역에서 도면참조/도면참고 탐지용(ingest와 동일 범위)."""
+    if items_df is not None and len(items_df) and "order_id" in items_df.columns and "order_id" in row.index:
+        return order_sheet_blob_for_drawing_ref(row, items_df)
+    parts: list[str] = []
+    for key in ("receiver_name", "delivery_request", "attention_note", "order_list", "special_issue", "deadline_raw"):
+        if key in row.index:
+            parts.append(str(row.get(key) or ""))
+    return "\n".join(parts)
+
+
+def _compact_name_display(
+    status: str, receiver_name: str, attention_note_val: object, *, sheet_blob: str = ""
+) -> str:
     att, has_att = _attention_note_str(attention_note_val)
     lead = _status_lead_icon(status)
     nick = _truncate_display_name(receiver_name, 8)
+    # 도면참조(구 주문제작): 이름 뒤 📐 — 본문에 도면참조·도면참고(엑셀 표기)가 있으면 표시
+    ss = (status or "").strip()
+    draw_after = ""
+    if ss in ("도면참조", "주문제작") or sheet_contains_drawing_ref_keyword(sheet_blob):
+        draw_after = " 📐"
     tail = _trailing_icon_segment(has_att, att, 3)
-    return f"{lead}{nick}{tail}".strip()
+    return f"{lead}{nick}{draw_after}{tail}".strip()
 
 
 def _attention_note_with_icon_export(att_val: object) -> str:
@@ -172,7 +218,72 @@ def _attention_note_with_icon_export(att_val: object) -> str:
     return icons
 
 
-def _backup_sqlite(db_path: str, backup_dir: str = "backups", keep_days: int = 30) -> str | None:
+# 자동 백업: 로컬 하루 최대 4번(6시간 구간당 1회), 파일명 시각 기준 keep_days 초과분 삭제
+BACKUP_RETENTION_DAYS = 30
+BACKUPS_PER_LOCAL_DAY = 4
+
+
+def _backup_db_basename(db_path: str) -> str:
+    return os.path.splitext(os.path.basename(db_path))[0] or "mutomo"
+
+
+def _backup_time_slot(now: dt.datetime | None = None) -> tuple[str, int]:
+    """로컬 날짜 YYYYMMDD와 0..BACKUPS_PER_LOCAL_DAY-1 구간(각 24/n 시간)."""
+    n = now or dt.datetime.now()
+    span = max(1, 24 // BACKUPS_PER_LOCAL_DAY)
+    return n.strftime("%Y%m%d"), n.hour // span
+
+
+def _sqlite_slot_already_has_backup(
+    db_path: str, backup_dir: str = "backups", now: dt.datetime | None = None
+) -> bool:
+    """같은 로컬일·같은 시간 구간에 이미 백업 sqlite가 있으면 True."""
+    n = now or dt.datetime.now()
+    day_s, slot = _backup_time_slot(n)
+    span = max(1, 24 // BACKUPS_PER_LOCAL_DAY)
+    h0, h1 = slot * span, (slot + 1) * span
+    base = _backup_db_basename(db_path)
+    prefix = f"{base}_{day_s}_"
+    try:
+        names = os.listdir(backup_dir)
+    except OSError:
+        return False
+    for name in names:
+        if not name.startswith(prefix) or not name.endswith(".sqlite"):
+            continue
+        stamp = name[len(base) + 1 :].replace(".sqlite", "")
+        try:
+            d = dt.datetime.strptime(stamp, "%Y%m%d_%H%M%S")
+        except Exception:
+            continue
+        if h0 <= d.hour < h1:
+            return True
+    return False
+
+
+def _prune_sqlite_backups(db_path: str, backup_dir: str = "backups", keep_days: int = BACKUP_RETENTION_DAYS) -> None:
+    """파일명 타임스탬프 기준 keep_days보다 오래된 동일-베이스 백업을 삭제(자동 백업과 CLI 공통 규칙)."""
+    base = _backup_db_basename(db_path)
+    try:
+        cutoff = dt.datetime.now() - dt.timedelta(days=keep_days)
+        for name in os.listdir(backup_dir):
+            if not name.startswith(base + "_") or not name.endswith(".sqlite"):
+                continue
+            stamp = name[len(base) + 1 :].replace(".sqlite", "")
+            try:
+                d = dt.datetime.strptime(stamp, "%Y%m%d_%H%M%S")
+            except Exception:
+                continue
+            if d < cutoff:
+                try:
+                    os.remove(os.path.join(backup_dir, name))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _backup_sqlite(db_path: str, backup_dir: str = "backups", keep_days: int = BACKUP_RETENTION_DAYS) -> str | None:
     """Create a safe SQLite backup file and return its path.
 
     Uses sqlite3.Connection.backup() so it works even while the DB is in use.
@@ -186,7 +297,7 @@ def _backup_sqlite(db_path: str, backup_dir: str = "backups", keep_days: int = 3
         return None
 
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = os.path.splitext(os.path.basename(db_path))[0] or "mutomo"
+    base = _backup_db_basename(db_path)
     out_path = os.path.join(backup_dir, f"{base}_{ts}.sqlite")
 
     try:
@@ -207,25 +318,7 @@ def _backup_sqlite(db_path: str, backup_dir: str = "backups", keep_days: int = 3
             pass
         return None
 
-    # Simple retention: keep last N days by filename timestamp (best-effort)
-    try:
-        cutoff = dt.datetime.now() - dt.timedelta(days=keep_days)
-        for name in os.listdir(backup_dir):
-            if not name.startswith(base + "_") or not name.endswith(".sqlite"):
-                continue
-            stamp = name[len(base) + 1 :].replace(".sqlite", "")
-            try:
-                d = dt.datetime.strptime(stamp, "%Y%m%d_%H%M%S")
-            except Exception:
-                continue
-            if d < cutoff:
-                try:
-                    os.remove(os.path.join(backup_dir, name))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
+    _prune_sqlite_backups(db_path, backup_dir, keep_days)
     return out_path
 
 
@@ -235,14 +328,24 @@ def _price_map_cached(price_path: str, price_mtime: float) -> tuple[dict, tuple[
 
 
 @st.cache_data
-def load_tables(db_path: str, _db_mtime: float, _db_size: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """`_db_mtime` / `_db_size`는 `mutomo.sqlite`가 바뀌면 같이 바뀌어 캐시를 무효화합니다."""
+def load_tables(db_path: str, db_mtime: float, db_size: int, reload_nonce: int = 0) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """db_mtime/db_size/reload_nonce는 캐시 키에 포함(언더스코어 접두 인자는 키에서 빠짐).
+
+    SQLite 파일이 바뀌면 mtime·size가 달라져 자동으로 다시 읽고, 'DB 다시 읽기'는 nonce로 강제 무효화합니다.
+    """
+    _ = (db_mtime, db_size, reload_nonce)
     con = sqlite3.connect(db_path)
     try:
         orders = pd.read_sql_query("select * from orders", con)
         items = pd.read_sql_query("select * from items", con)
     finally:
         con.close()
+    if "status" in orders.columns:
+        s0 = orders["status"].astype(str).str.strip()
+        orders = orders.copy()
+        orders["status"] = s0.mask(s0 == "주문제작", "도면참조")
+    # 엑셀 본문에 도면참조·도면참고가 있고 status가 접수인 주문 → 도면참조로 승격(재수집 시에도 동일)
+    orders = apply_drawing_ref_status_from_sheet(orders, items)
     return orders, items
 
 
@@ -543,45 +646,6 @@ def _excel_ship_for_picking_row(order_id: object, items_df: pd.DataFrame, pick_k
     return _ship_display_label(lab)
 
 
-# ingest_xlsx.COLOR_WORDS / _shelf_color_fallback_from_leg_cell 와 동일 규칙 (표시용만; import 순환·버전 차이 방지)
-_SHELF_FROM_NOTE_COLOR_KEYWORDS: tuple[str, ...] = (
-    "크림화이트",
-    "크림",
-    "오프화이트",
-    "화이트",
-    "블랙",
-    "그레이",
-    "월넛",
-    "오크",
-    "베이지",
-    "브라운",
-    "내추럴",
-    "자작",
-    "올드블루진스",
-    "런던브릭",
-)
-
-
-def _dashboard_shelf_color_from_note_raw(note_raw: object) -> str | None:
-    """note_raw(엑셀 다리색 열 원본)에만 원단명이 있을 때 책장색 칸 표시 보정."""
-    if note_raw is None:
-        return None
-    try:
-        if pd.isna(note_raw):
-            return None
-    except Exception:
-        pass
-    t = str(note_raw).replace("\n", " ")
-    if not t.strip():
-        return None
-    if re.search(r"다리", t):
-        return None
-    for c in _SHELF_FROM_NOTE_COLOR_KEYWORDS:
-        if c in t:
-            return c
-    return None
-
-
 def _items_view_from_item_rows(df: pd.DataFrame) -> pd.DataFrame:
     """이미 주문 1건 분의 품목 행만 담은 데이터프레임 → 표시용 뷰."""
     if df is None or len(df) == 0:
@@ -605,7 +669,7 @@ def _items_view_from_item_rows(df: pd.DataFrame) -> pd.DataFrame:
             s = r.get("shelf_color")
             if s is not None and not (isinstance(s, float) and pd.isna(s)) and str(s).strip():
                 return s
-            fb = _dashboard_shelf_color_from_note_raw(r.get("note_raw"))
+            fb = shelf_color_from_note_raw_cell(r.get("note_raw"))
             return fb if fb else s
 
         df["shelf_color"] = df.apply(_fill_shelf_from_note, axis=1)
@@ -799,9 +863,11 @@ def _render_order_detail(container: st.delta_generator.DeltaGenerator, order_row
         if s == "클레임":
             return "⚠️ 클레임", "#FFE4CC", "#E65100", "#8A2E00"
         if s == "마감":
-            return "🧾 마감", "#E0E0E0", "#37474F", "#263238"
+            return "💰✅ 마감(청구)", "#E8F5E9", "#1B5E20", "#1B5E20"
         if s == "접수":
             return "📝⏳ 접수(납품예정)", "#D6ECFF", "#0D47A1", "#0D47A1"
+        if s == "도면참조":
+            return "📐 도면참조", "#F3E5F5", "#6A1B9A", "#4A148C"
         if s == "납품취소":
             return "⛔ 납품취소", "#FFEBEE", "#B71C1C", "#B71C1C"
         return (s or "상태 없음"), "#ECEFF1", "#607D8B", "#37474F"
@@ -1483,6 +1549,8 @@ def update_special_issue_for_orders(db_path: str, order_ids: list[str], text: st
 
 
 def init_shared_session_state() -> None:
+    if "mutomo_db_reload_nonce" not in st.session_state:
+        st.session_state["mutomo_db_reload_nonce"] = 0
     if "active_selector" not in st.session_state:
         st.session_state["active_selector"] = None  # "search" | "table"
     if "search_pick_ids" not in st.session_state:
@@ -1497,6 +1565,53 @@ def init_shared_session_state() -> None:
         st.session_state["request_clear_search_pick_labels"] = False
     if "table_sync_from_search" not in st.session_state:
         st.session_state["table_sync_from_search"] = False
+
+
+# 접수로 되돌리기 전 확인(메인 영역에 표시 — 사이드바 맨 아래에 묻히지 않게)
+MUTOMO_PENDING_REVERT_KEY = "mutomo_pending_revert_received"
+
+# 사이드바 상태 필터·버튼에서 공통 사용 (SQLite `orders.status` 텍스트)
+ORDER_STATUS_FILTER_OPTIONS: tuple[str, ...] = (
+    "접수",
+    "도면참조",
+    "클레임",
+    "출고",
+    "마감",
+    "납품취소",
+)
+# 접수로 되돌릴 때는 '도면만 받은 단계(도면참조)'까지는 경고 없이(접수와 동일 취급)
+_PRE_SHIP_STATUSES_FOR_REVERT: frozenset[str] = frozenset({"접수", "도면참조"})
+
+
+def _revert_to_received_warn_message(sub: pd.DataFrame) -> tuple[bool, str]:
+    """접수로 되돌리기 전 경고가 필요한지, 요약 문구(한 줄)를 돌려준다."""
+    if sub is None or len(sub) == 0:
+        return False, ""
+    parts: list[str] = []
+    need = False
+    if "status" in sub.columns:
+        stt = sub["status"].astype(str).str.strip()
+        other = stt[~stt.isin(_PRE_SHIP_STATUSES_FOR_REVERT)]
+        if len(other):
+            need = True
+            vc = other.value_counts()
+            for k, v in vc.items():
+                parts.append(f"{k} {int(v)}건")
+    ts_parts: list[str] = []
+    if "shipped_at" in sub.columns:
+        sa = sub["shipped_at"].astype(str).fillna("").str.strip()
+        n = int(((sa != "") & (sa.str.lower() != "nan")).sum())
+        if n:
+            need = True
+            ts_parts.append(f"출고시각 있음 {n}건")
+    if "closed_at" in sub.columns:
+        ca = sub["closed_at"].astype(str).fillna("").str.strip()
+        n = int(((ca != "") & (ca.str.lower() != "nan")).sum())
+        if n:
+            need = True
+            ts_parts.append(f"마감시각 있음 {n}건")
+    msg = " / ".join([*parts, *ts_parts])
+    return need, msg
 
 
 # 이름 검색 → 전체 접수 표 선택 연동 시 한 번에 넘길 최대 행 수 (브라우저·Streamlit 부담 완화)
@@ -1697,7 +1812,9 @@ def _prune_name_search_row_input_keys(n_terms: int) -> None:
             st.session_state.pop(k, None)
 
 
-def _build_order_picker_lists(rows: pd.DataFrame) -> tuple[dict[str, str], list[str], list[str]]:
+def _build_order_picker_lists(
+    rows: pd.DataFrame, items_df: pd.DataFrame | None = None
+) -> tuple[dict[str, str], list[str], list[str]]:
     """행별 multiselect용 (라벨→order_id, 옵션, 기본 선택). rows는 정렬된 검색 결과."""
     if rows.empty or "order_id" not in rows.columns:
         return {}, [], []
@@ -1714,8 +1831,11 @@ def _build_order_picker_lists(rows: pd.DataFrame) -> tuple[dict[str, str], list[
         purchase = str(row.get("purchase_date") or "").strip()
         name = str(row.get("receiver_name") or "").strip()
         status = str(row.get("status") or "").strip()
-        att_v = _strip_order_list_overlap(row.get("attention_note"), row.get("order_list"))
-        name_seg = _compact_name_display(status, name, att_v or None)
+        att_stripped = _strip_order_list_overlap(row.get("attention_note"), row.get("order_list"))
+        att_src = _combined_attention_for_icons(att_stripped or None, row.get("special_issue"))
+        name_seg = _compact_name_display(
+            status, name, att_src, sheet_blob=_drawing_ref_sheet_blob(row, items_df)
+        )
         order_list = str(row.get("order_list") or "").strip().replace("\n", " / ")
         order_list = (order_list[:120] + "…") if len(order_list) > 121 else order_list
         base = f"{purchase} | {name_seg} | {order_list}".strip(" |")
@@ -1757,7 +1877,7 @@ def render_receiver_name_search(
     orders_name_hints: pd.DataFrame | None = None,
 ) -> None:
     """이름(좁은 칸) + 옆 multiselect(라벨 숨김, 줄 맞춤). 다음 줄은 폼에서 Enter로 추가. OR 합쳐 출고."""
-    _ = items  # 상세는 메인에서 제거; 사이드바/표에서 확인
+    # 품목줄까지 포함한 도면참조 표시(📐)에 사용. 상세 UI는 메인에서 제거됨.
     nh = orders_name_hints if orders_name_hints is not None else orders
     st.subheader("검색")
     if "name_search_terms" not in st.session_state:
@@ -1930,7 +2050,7 @@ def render_receiver_name_search(
         row_hits = _sort_hits_block(row_hits)
         tags = _identity_hint_tags(row_hits)
         mk = f"row_pick_labels_{i}"
-        _, options_r, default_lbl_r = _build_order_picker_lists(row_hits)
+        _, options_r, default_lbl_r = _build_order_picker_lists(row_hits, items)
         if not options_r:
             # 0건일 때 pop 하면 다음 렌더에서 복귀해도 선택이 영구 사라짐 → 일시 0건은 키 유지
             if len(row_hits) > 0:
@@ -1997,7 +2117,7 @@ def render_receiver_name_search(
         picked = st.session_state.get(mk2, [])
         if len(rh) == 0:
             return True
-        _, opts, _ = _build_order_picker_lists(rh)
+        _, opts, _ = _build_order_picker_lists(rh, items)
         if not opts:
             return True
         return len(picked) >= 1
@@ -2066,7 +2186,7 @@ def render_receiver_name_search(
             continue
         row_hits = orders[nm_series.str.contains(tl, case=False, na=False, regex=False)].copy()
         row_hits = _sort_hits_block(row_hits)
-        ltd, _opts, _ = _build_order_picker_lists(row_hits)
+        ltd, _opts, _ = _build_order_picker_lists(row_hits, items)
         mk3 = f"row_pick_labels_{i}"
         for lbl in st.session_state.get(mk3, []):
             oid = str(ltd.get(lbl, "")).strip()
@@ -2102,14 +2222,16 @@ def render_receiver_name_search(
         st.session_state["prev_search_pick_ids"] = pick_ids
 
     ship_action = st.button("선택 건 출고 처리", type="primary", key="ship_one_button")
-    rc1, rc2, rc3, rc4 = st.columns(4)
+    rc1, rc2, rc3, rc4, rc5 = st.columns(5)
     with rc1:
         claim_action = st.button("클레임", key="status_claim")
     with rc2:
-        back_to_received_action = st.button("접수", key="status_received")
+        custom_order_action = st.button("도면참조", key="status_custom_order", help="도면 주고 제작 요청 등")
     with rc3:
-        close_action = st.button("마감", key="status_close")
+        back_to_received_action = st.button("접수", key="status_received")
     with rc4:
+        close_action = st.button("마감", key="status_close")
+    with rc5:
         cancel_action = st.button("납품취소", key="status_cancel")
 
     if ship_action and pick_ids:
@@ -2123,7 +2245,7 @@ def render_receiver_name_search(
         if not pending_ship:
             st.warning(
                 "선택한 주문이 모두 **이미 출고 처리**되었습니다. "
-                "미출고(접수·클레임 등) 주문만 골라 주세요."
+                "미출고(접수·도면참조·클레임 등) 주문만 골라 주세요."
             )
         else:
             if already_shipped:
@@ -2158,7 +2280,34 @@ def render_receiver_name_search(
         st.cache_data.clear()
         st.rerun()
 
+    if custom_order_action and pick_ids:
+        con = sqlite3.connect(db_path)
+        try:
+            cur = con.cursor()
+            cur.executemany(
+                "UPDATE orders SET status=?, closed_at=NULL WHERE order_id=?",
+                [("도면참조", oid) for oid in pick_ids],
+            )
+            con.commit()
+        finally:
+            con.close()
+        st.success("도면참조로 변경했습니다.")
+        st.cache_data.clear()
+        st.rerun()
+
     if back_to_received_action and pick_ids:
+        if "order_id" in orders_all.columns:
+            sub0 = orders_all[orders_all["order_id"].astype(str).isin([str(x) for x in pick_ids])].copy()
+        else:
+            sub0 = pd.DataFrame()
+        need_warn, wmsg = _revert_to_received_warn_message(sub0)
+        if need_warn:
+            st.session_state[MUTOMO_PENDING_REVERT_KEY] = {
+                "order_ids": [str(x) for x in pick_ids],
+                "source": "search",
+                "message": wmsg,
+            }
+            st.rerun()
         con = sqlite3.connect(db_path)
         try:
             cur = con.cursor()
@@ -2169,7 +2318,7 @@ def render_receiver_name_search(
             con.commit()
         finally:
             con.close()
-        st.success("출고 취소(접수로 변경 + 출고시간 초기화) 했습니다.")
+        st.success("접수로 변경했습니다. (출고시간/마감시간 초기화)")
         st.cache_data.clear()
         st.rerun()
 
@@ -2603,8 +2752,11 @@ def main() -> None:
     st.markdown(
         """
 <style>
-  section[data-testid="stSidebar"] { width: 560px !important; }
-  section[data-testid="stSidebar"] > div { width: 560px !important; }
+  /* Sidebar width: keep wide when expanded, but let it fully collapse without "ghost" space */
+  section[data-testid="stSidebar"] { width: 560px !important; min-width: 560px !important; }
+  section[data-testid="stSidebar"] > div { width: 560px !important; min-width: 560px !important; }
+  section[data-testid="stSidebar"][aria-expanded="false"] { width: 0px !important; min-width: 0px !important; }
+  section[data-testid="stSidebar"][aria-expanded="false"] > div { width: 0px !important; min-width: 0px !important; }
   .block-container { padding-top: 0.75rem !important; padding-bottom: 0.5rem !important; }
 </style>
         """,
@@ -2616,13 +2768,35 @@ def main() -> None:
     # DB missing / unreadable messages (written from sidebar 설정 expander)
     main_db_slot = st.empty()
 
+    # Sidebar top navigation (replaces main top tabs/links)
+    if "mutomo_page" not in st.session_state:
+        st.session_state["mutomo_page"] = "page1"
+    with st.sidebar.container():
+        c_nav1, c_nav2, c_nav3 = st.columns(3)
+        cur_page = str(st.session_state.get("mutomo_page") or "page1")
+
+        def _go(page_key: str) -> None:
+            st.session_state["mutomo_page"] = page_key
+            st.rerun()
+
+        with c_nav1:
+            if st.button("출고", type=("primary" if cur_page == "page2" else "secondary"), key="nav_page2"):
+                _go("page2")
+        with c_nav2:
+            if st.button("접수목록", type=("primary" if cur_page == "page1" else "secondary"), key="nav_page1"):
+                _go("page1")
+        with c_nav3:
+            if st.button("마감", type=("primary" if cur_page == "page3" else "secondary"), key="nav_page3"):
+                _go("page3")
+        st.divider()
+
     # Settings in sidebar (collapsed)
     with st.sidebar.expander("설정", expanded=False):
         db_path = st.text_input("DB 경로", value="mutomo.sqlite", key="mutomo_db_path")
         q1, q2, q3 = st.columns(3)
         with q1:
             if st.button("전체", key="quick_status_all", help="상태 필터를 전체로"):
-                st.session_state["mutomo_status_filter"] = ["접수", "클레임", "출고", "마감", "납품취소"]
+                st.session_state["mutomo_status_filter"] = list(ORDER_STATUS_FILTER_OPTIONS)
                 st.rerun()
         with q2:
             if st.button("마감", key="quick_status_closed", help="마감만 보기"):
@@ -2634,8 +2808,8 @@ def main() -> None:
                 st.rerun()
         status_filter = st.multiselect(
             "상태 필터",
-            options=["접수", "클레임", "출고", "마감", "납품취소"],
-            default=["접수", "출고", "마감", "클레임"],
+            options=list(ORDER_STATUS_FILTER_OPTIONS),
+            default=list(ORDER_STATUS_FILTER_OPTIONS),
             key="mutomo_status_filter",
         )
         date_basis = st.selectbox(
@@ -2650,22 +2824,57 @@ def main() -> None:
             mtime = "unknown"
         st.caption(f"dashboard.py: {__file__} (mtime: {mtime})")
 
-        # Automatic DB backup (once per day per user session)
-        if "last_db_backup_day" not in st.session_state:
-            st.session_state["last_db_backup_day"] = None
-        today_key = dt.date.today().isoformat()
-        if st.session_state.get("last_db_backup_day") != today_key:
-            out = _backup_sqlite(db_path, backup_dir="backups", keep_days=30)
-            st.session_state["last_db_backup_day"] = today_key
+        # 자동 DB 백업: 로컬 하루 최대 4회(6시간마다 한 번), 30일 넘은 백업 파일은 삭제
+        _prune_sqlite_backups(db_path, backup_dir="backups", keep_days=BACKUP_RETENTION_DAYS)
+        if not _sqlite_slot_already_has_backup(db_path, "backups"):
+            out = _backup_sqlite(db_path, backup_dir="backups", keep_days=BACKUP_RETENTION_DAYS)
             if out:
-                st.caption(f"DB 자동백업: `{out}`")
+                st.caption(f"DB 자동백업(이번 6시간 구간): `{out}`")
 
         st.caption(
-            "`order_list` 안 엑셀만 바꿨다면 DB는 안 바뀝니다. 터미널에서 **ingest**를 다시 실행한 뒤 아래를 누르거나 브라우저를 새로고침하세요."
+            "**엑셀→DB 수집**: 이 프로젝트의 `order_list` 폴더에 있는 `.xlsx`를 읽어 아래 DB 경로의 SQLite에 반영합니다. "
+            "**DB 다시 읽기**: 디스크에 이미 반영된 DB만 화면 캐시에서 다시 불러옵니다."
         )
-        if st.button("DB 다시 읽기", key="reload_db_cache", help="ingest 후 화면이 그대로일 때"):
-            st.cache_data.clear()
-            st.rerun()
+        _ing1, _ing2 = st.columns(2)
+        with _ing1:
+            if st.button(
+                "엑셀→DB 수집",
+                key="ingest_order_list_btn",
+                help="`order_list` 전체 .xlsx → 설정의 DB 파일(터미널 `ingest_xlsx.py`와 동일)",
+                use_container_width=True,
+            ):
+                with st.spinner("`order_list`에서 엑셀 읽는 중…"):
+                    _ok_ing, _msg_ing = run_ingest(
+                        db_path,
+                        input_dir="order_list",
+                        aliases_path="product_aliases.yml",
+                    )
+                if _ok_ing:
+                    st.session_state["mutomo_db_reload_nonce"] = int(st.session_state.get("mutomo_db_reload_nonce", 0)) + 1
+                    st.session_state["mutomo_toast_after_ingest"] = _msg_ing
+                    try:
+                        load_tables.clear()
+                    except Exception:
+                        pass
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(_msg_ing)
+        with _ing2:
+            if st.button(
+                "DB 다시 읽기",
+                key="reload_db_cache",
+                help="DB 파일은 그대로 두고 화면만 최신 DB로 갱신",
+                use_container_width=True,
+            ):
+                st.session_state["mutomo_db_reload_nonce"] = int(st.session_state.get("mutomo_db_reload_nonce", 0)) + 1
+                st.session_state["mutomo_show_db_reload_toast"] = True
+                try:
+                    load_tables.clear()
+                except Exception:
+                    pass
+                st.cache_data.clear()
+                st.rerun()
 
         ok_db, db_msg = _db_ready(db_path)
         if not ok_db:
@@ -2682,7 +2891,15 @@ def main() -> None:
 
         _migrate_orders_schema(db_path)
         _mt, _sz = _db_stat_for_cache(db_path)
-        orders_all, items_all = load_tables(db_path, _mt, _sz)
+        _rn = int(st.session_state.get("mutomo_db_reload_nonce", 0))
+        orders_all, items_all = load_tables(db_path, _mt, _sz, _rn)
+        if _ti := st.session_state.pop("mutomo_toast_after_ingest", None):
+            st.toast(str(_ti), icon="✅")
+        elif st.session_state.pop("mutomo_show_db_reload_toast", False):
+            st.toast(
+                f"DB를 다시 읽었습니다. 주문 {len(orders_all):,}건, 품목 {len(items_all):,}줄.",
+                icon="✅",
+            )
 
         try:
             con0 = sqlite3.connect(db_path)
@@ -2765,7 +2982,7 @@ def main() -> None:
         else:
             close_statuses = st.multiselect(
                 "대상 상태",
-                options=["출고", "마감", "접수", "클레임", "납품취소"],
+                options=list(ORDER_STATUS_FILTER_OPTIONS),
                 default=["출고"],
                 key="close_period_statuses",
                 help="보통은 출고만 선택합니다. 이미 마감인 주문을 포함하면 중복 업데이트가 늘어납니다.",
@@ -2915,8 +3132,138 @@ def main() -> None:
 
     ship_tbl = claim_tbl = back_tbl = close_tbl = cancel_tbl = False
 
-    tab_sales, tab_name_search, tab_sales_period = st.tabs(["판매 요약", "이름 검색", "기간별 판매집계"])
-    with tab_name_search:
+    # Build the shared "접수 목록" table frames (used by page1 + sidebar detail editor)
+    user_cols = [
+        "purchase_date",
+        "receiver_name",
+        "동일연락처",
+        "배송(엑셀)",
+        "order_list",
+        "address",
+        "phone",
+        "delivery_request",
+        "attention_note",
+        "special_issue",
+        "status",
+    ]
+    admin_cols = [
+        "order_id",
+        "party_key",
+        "source_file",
+        "group_no",
+        "deadline_raw",
+        "order_date_raw",
+        "created_at",
+    ]
+    all_cols = user_cols + (admin_cols if show_admin_cols else [])
+    sort_cols_all = [c for c in ["source_file", "group_no"] if c in orders.columns]
+    sorted_orders = orders.drop(columns=["_date"], errors="ignore")
+    if sort_cols_all:
+        sorted_orders = sorted_orders.sort_values(sort_cols_all, na_position="last")
+    if "order_id" in sorted_orders.columns and len(items_all) and "order_id" in items_all.columns:
+        _ship_map = infer_settlement_ship_series(items_all)
+        sorted_orders = sorted_orders.copy()
+        sorted_orders["배송(엑셀)"] = (
+            sorted_orders["order_id"].astype(str).map(_ship_map).fillna("택배").map(_ship_display_label)
+        )
+    if "party_key" in sorted_orders.columns:
+        _pk = sorted_orders["party_key"].astype(str)
+        _grp_n = _pk.groupby(_pk).transform("count")
+        sorted_orders["동일연락처"] = _grp_n.map(lambda x: f"{int(x)}건" if int(x) > 1 else "—")
+    else:
+        sorted_orders = sorted_orders.copy()
+        sorted_orders["동일연락처"] = "—"
+    view_orders = sorted_orders[[c for c in all_cols if c in sorted_orders.columns]].copy()
+
+    # Make status visually distinct (emoji badges). Streamlit's dataframe has limited per-row styling.
+    if "status" in view_orders.columns:
+        def _badge(s: object) -> str:
+            ss = "" if s is None else str(s).strip()
+            if ss == "출고":
+                return "🚚✅ 출고완료"
+            if ss == "접수":
+                return "📝⏳ 접수"
+            if ss == "도면참조":
+                return "📐 도면참조"
+            if ss == "클레임":
+                return "⚠️ 클레임"
+            if ss == "마감":
+                return "💰✅ 마감"
+            if ss == "납품취소":
+                return "⛔ 납품취소"
+            return ss or ""
+
+        view_orders["status"] = view_orders["status"].map(_badge)
+
+    # 한 칸: 상태 이모지 1 + 이름(최대 8자) + 뒤 아이콘 최대 3 (status 열은 긴 뱃지 유지).
+    if "receiver_name" in view_orders.columns and "status" in sorted_orders.columns:
+        def _name_emoji(row) -> str:
+            name = "" if row.get("receiver_name") is None else str(row.get("receiver_name")).strip()
+            stt = "" if row.get("status") is None else str(row.get("status")).strip()
+            att_src = _combined_attention_for_icons(row.get("attention_note"), row.get("special_issue"))
+            blob = _drawing_ref_sheet_blob(row, items_all)
+            return _compact_name_display(stt, name, att_src, sheet_blob=blob)
+
+        # Use sorted_orders for original status values
+        cols_tmp = [
+            c
+            for c in [
+                "receiver_name",
+                "status",
+                "attention_note",
+                "special_issue",
+                "order_list",
+                "order_id",
+                "delivery_request",
+                "deadline_raw",
+            ]
+            if c in sorted_orders.columns
+        ]
+        tmp = sorted_orders.loc[view_orders.index, cols_tmp].copy()
+        view_orders["receiver_name"] = tmp.apply(_name_emoji, axis=1)
+
+    # Page routing (sidebar buttons)
+    page = str(st.session_state.get("mutomo_page") or "page1")
+    selected_ids: list[str] = []
+
+    if page == "page1":
+        pend = st.session_state.get(MUTOMO_PENDING_REVERT_KEY)
+        if pend and isinstance(pend, dict):
+            ids = [str(x) for x in (pend.get("order_ids") or [])]
+            wmsg = str(pend.get("message") or "").strip()
+            src = str(pend.get("source") or "")
+            src_ko = "이름 검색에서 고른 주문" if src == "search" else "접수 목록에서 고른 주문"
+            st.warning(
+                f"**접수로 되돌리기 확인** ({src_ko})\n\n"
+                f"- 요약: {wmsg if wmsg else '이미 처리 이력이 있습니다.'}\n\n"
+                "계속하면 **출고시각·마감시각**이 비워지고 상태가 **접수**로 바뀝니다."
+            )
+            c_can, c_ok = st.columns(2)
+            with c_can:
+                if st.button("취소", key="mutomo_pending_revert_cancel"):
+                    st.session_state.pop(MUTOMO_PENDING_REVERT_KEY, None)
+                    st.rerun()
+            with c_ok:
+                if st.button("그래도 접수로 변경", type="primary", key="mutomo_pending_revert_confirm"):
+                    _dbp = str(st.session_state.get("mutomo_db_path", "mutomo.sqlite"))
+                    if ids:
+                        con = sqlite3.connect(_dbp)
+                        try:
+                            cur = con.cursor()
+                            cur.executemany(
+                                "UPDATE orders SET status=?, shipped_at=NULL, closed_at=NULL WHERE order_id=?",
+                                [("접수", oid) for oid in ids],
+                            )
+                            con.commit()
+                        finally:
+                            con.close()
+                    st.session_state.pop(MUTOMO_PENDING_REVERT_KEY, None)
+                    st.success(f"접수로 변경했습니다: {len(ids)}건")
+                    st.cache_data.clear()
+                    st.rerun()
+            st.divider()
+        # page1: 접수목록
+        st.subheader("접수목록")
         # 이름 검색은 사이드바 상태 필터와 무관하게 "전체 주문"에서 찾는 게 자연스럽다.
         render_receiver_name_search(orders_all, items_all, db_path, orders_name_hints=orders_all)
         st.divider()
@@ -2927,104 +3274,31 @@ def main() -> None:
                 "느려지면 상태 필터로 줄이거나, ingest 전에 SQLite에서 기간·상태로 나눠 저장하는 방식을 검토하세요."
             )
         st.caption(
-            "🟥 표시는 엑셀 A열의 ‘특이사항(자동)’이 있는 주문입니다. "
+            "🟥 표시는 **특이사항(자동)** 또는 **특이사항(수기)** 이 있는 주문입니다. (이름 열 아이콘에 둘 다 반영됩니다.) "
             "**배송(엑셀)** 은 목록에서만 보는 품목 배송란 다수결 요약입니다. "
             "사이드바 상세의 배송은 **품목** 아래 **배송:** 에 적힌 엑셀 원문만 쓰며, 변경은 현장에서 처리합니다. "
             "**동일연락처** 는 전화(또는 주소)로 묶은 그룹 안의 접수 건수(재주문·동일 수하인 힌트)이며, "
             "확정 식별은 항상 **order_id**(한 줄 한 접수)입니다."
         )
-        user_cols = [
-            "purchase_date",
-            "receiver_name",
-            "동일연락처",
-            "배송(엑셀)",
-            "order_list",
-            "address",
-            "phone",
-            "delivery_request",
-            "attention_note",
-            "special_issue",
-            "status",
-        ]
-        admin_cols = [
-            "order_id",
-            "party_key",
-            "source_file",
-            "group_no",
-            "deadline_raw",
-            "order_date_raw",
-            "created_at",
-        ]
-        all_cols = user_cols + (admin_cols if show_admin_cols else [])
-        sort_cols_all = [c for c in ["source_file", "group_no"] if c in orders.columns]
-        sorted_orders = orders.drop(columns=["_date"], errors="ignore")
-        if sort_cols_all:
-            sorted_orders = sorted_orders.sort_values(sort_cols_all, na_position="last")
-        if "order_id" in sorted_orders.columns and len(items_all) and "order_id" in items_all.columns:
-            _ship_map = infer_settlement_ship_series(items_all)
-            sorted_orders = sorted_orders.copy()
-            sorted_orders["배송(엑셀)"] = (
-                sorted_orders["order_id"].astype(str).map(_ship_map).fillna("택배").map(_ship_display_label)
-            )
-        if "party_key" in sorted_orders.columns:
-            _pk = sorted_orders["party_key"].astype(str)
-            _grp_n = _pk.groupby(_pk).transform("count")
-            sorted_orders["동일연락처"] = _grp_n.map(lambda x: f"{int(x)}건" if int(x) > 1 else "—")
-        else:
-            sorted_orders = sorted_orders.copy()
-            sorted_orders["동일연락처"] = "—"
-        view_orders = sorted_orders[[c for c in all_cols if c in sorted_orders.columns]].copy()
 
-        # Make status visually distinct (emoji badges). Streamlit's dataframe has limited per-row styling.
-        if "status" in view_orders.columns:
-            def _badge(s: object) -> str:
-                ss = "" if s is None else str(s).strip()
-                if ss == "출고":
-                    return "🚚✅ 출고완료"
-                if ss == "접수":
-                    return "📝⏳ 접수"
-                if ss == "클레임":
-                    return "⚠️ 클레임"
-                if ss == "마감":
-                    return "🟩✅✅ 마감"
-                if ss == "납품취소":
-                    return "⛔ 납품취소"
-                return ss or ""
-
-            view_orders["status"] = view_orders["status"].map(_badge)
-
-        # 한 칸: 상태 이모지 1 + 이름(최대 8자) + 뒤 아이콘 최대 3 (status 열은 긴 뱃지 유지).
-        if "receiver_name" in view_orders.columns and "status" in sorted_orders.columns:
-            def _name_emoji(row) -> str:
-                name = "" if row.get("receiver_name") is None else str(row.get("receiver_name")).strip()
-                stt = "" if row.get("status") is None else str(row.get("status")).strip()
-                # 아이콘은 원본 특이사항(자동)에서 뽑는다. (order_list 중복 제거 결과가 비면 아이콘도 같이 사라질 수 있음)
-                return _compact_name_display(stt, name, row.get("attention_note"))
-
-            # Use sorted_orders for original status values
-            cols_tmp = [
-                c for c in ["receiver_name", "status", "attention_note", "order_list"] if c in sorted_orders.columns
-            ]
-            tmp = sorted_orders.loc[view_orders.index, cols_tmp].copy()
-            view_orders["receiver_name"] = tmp.apply(_name_emoji, axis=1)
-
-        st.caption("행을 선택하면 왼쪽 사이드바에 주문상세가 표시됩니다. 선택을 모두 해제하면 상세가 사라집니다.")
-        st.caption("목록에서 행을 고른 뒤 아래 버튼으로 출고·클레임 등 상태를 바꿀 수 있습니다.")
-        tb0, tb1, tb2, tb3, tb4, tb5 = st.columns([1, 1, 1, 1, 1, 1])
-        with tb0:
+        st.caption(
+            "행을 고르면 왼쪽 사이드바에 상세가 뜹니다. "
+            "**도면참조**는 엑셀 본문·이름 검색에서 반영됩니다."
+        )
+        b0, b1, b2, b3, b4, b5 = st.columns(6, gap="small")
+        with b0:
             clear_pick = st.button("선택 해제", key="table_clear_selection_btn", help="표 선택(체크)을 세션에서 초기화합니다.")
-        with tb1:
+        with b1:
             ship_tbl = st.button("선택 출고", type="primary", key="table_ship_btn")
-        with tb2:
+        with b2:
             claim_tbl = st.button("클레임", key="table_claim_btn")
-        with tb3:
+        with b3:
             back_tbl = st.button("접수", key="table_received_btn")
-        with tb4:
+        with b4:
             close_tbl = st.button("마감", key="table_close_btn")
-        with tb5:
+        with b5:
             cancel_tbl = st.button("납품취소", key="table_cancel_btn")
-        selected_ids: list[str] = []
-        table_selection_supported = False
+
         name_col_cfg: dict | None = None
         _cols_cfg: dict = {}
         if "receiver_name" in view_orders.columns:
@@ -3037,6 +3311,7 @@ def main() -> None:
             _cols_cfg["party_key"] = st.column_config.TextColumn("party_key", width="small")
         if _cols_cfg:
             name_col_cfg = _cols_cfg
+
         if "order_id" in sorted_orders.columns:
             _df_sel_key = "mutomo_full_orders_df"
             if clear_pick:
@@ -3047,17 +3322,12 @@ def main() -> None:
                 if _df_sel_key in st.session_state:
                     st.session_state[_df_sel_key] = {"selection": {"rows": [], "columns": [], "cells": []}}
                 st.rerun()
+
             if st.session_state.pop("_search_sync_need_df_apply", False):
                 sync_ids = st.session_state.get("_search_sync_order_ids") or []
                 idset = set(sync_ids)
-                row_idxs = [
-                    i
-                    for i in range(len(sorted_orders))
-                    if str(sorted_orders.iloc[i]["order_id"]) in idset
-                ]
-                st.session_state[_df_sel_key] = {
-                    "selection": {"rows": row_idxs, "columns": [], "cells": []},
-                }
+                row_idxs = [i for i in range(len(sorted_orders)) if str(sorted_orders.iloc[i]["order_id"]) in idset]
+                st.session_state[_df_sel_key] = {"selection": {"rows": row_idxs, "columns": [], "cells": []}}
             else:
                 # Streamlit dataframe selection can briefly reset across reruns, or row indices can drift if the
                 # table order changes. Re-align widget row selection with persisted order_ids in `view_orders`.
@@ -3087,11 +3357,8 @@ def main() -> None:
                                         continue
                                     prev_rows.append(xi)
                         if prev_rows != row_idxs2:
-                            st.session_state[_df_sel_key] = {
-                                "selection": {"rows": row_idxs2, "columns": [], "cells": []},
-                            }
+                            st.session_state[_df_sel_key] = {"selection": {"rows": row_idxs2, "columns": [], "cells": []}}
             try:
-                # Streamlit row selection (supported in recent versions)
                 state = st.dataframe(
                     view_orders,
                     use_container_width=True,
@@ -3101,19 +3368,37 @@ def main() -> None:
                     selection_mode="multi-row",
                     key=_df_sel_key,
                 )
-                table_selection_supported = True
                 if state is not None and hasattr(state, "selection"):
                     rows = getattr(state.selection, "rows", []) or []
-                    # Map visible row indices -> order_id from sorted_orders
-                    selected_ids = sorted_orders.iloc[rows]["order_id"].astype(str).tolist()
+                    # selection.rows는 표시된 표 기준 위치인데, 필터·재수집 후 행 수가 줄면 이전 인덱스가 남아 IndexError가 난다.
+                    n_vis = len(view_orders)
+                    valid_rows: list[int] = []
+                    for x in rows:
+                        try:
+                            xi = int(x)
+                        except (TypeError, ValueError):
+                            continue
+                        if 0 <= xi < n_vis:
+                            valid_rows.append(xi)
+                    if valid_rows:
+                        # view_orders는 화면 표시용이라 order_id 컬럼이 없을 수 있음(관리 컬럼 숨김).
+                        # 대신 view_orders의 인덱스를 기준으로 sorted_orders에서 order_id를 뽑는다.
+                        base = sorted_orders.loc[view_orders.index]
+                        if "order_id" in base.columns:
+                            selected_ids = base.iloc[valid_rows]["order_id"].astype(str).tolist()
+                    elif rows:
+                        # 표가 줄거나 정렬이 바뀌는 순간 Streamlit이 잠깐 잘못된 row index를 보낼 수 있다.
+                        # 이 때 선택을 "꺼버리면" UX가 나빠서, 기존에 저장된 order_id 선택을 유지한다.
+                        selected_ids = [str(x) for x in (st.session_state.get("selected_ids_from_table") or []) if str(x)]
             except TypeError:
                 # Older Streamlit: no selection support, just show the table.
                 st.dataframe(view_orders, use_container_width=True, hide_index=True, column_config=name_col_cfg)
         else:
             st.dataframe(view_orders, use_container_width=True, hide_index=True, column_config=name_col_cfg)
 
-
-    with tab_sales:
+    elif page == "page2":
+        # page2: 출고
+        st.subheader("출고")
         with st.container():
 
             def _sales_section_bar() -> None:
@@ -3127,11 +3412,13 @@ def main() -> None:
             s = orders_all["status"] if "status" in orders_all.columns else pd.Series([], dtype=str)
             total_cnt = len(orders_all)
             planned_cnt = int((s == "접수").sum()) if len(s) else 0
+            custom_cnt = int((s == "도면참조").sum()) if len(s) else 0
             done_cnt = int((s == "출고").sum()) if len(s) else 0
             claim_cnt = int((s == "클레임").sum()) if len(s) else 0
+            closed_cnt = int((s == "마감").sum()) if len(s) else 0
             cancel_cnt = int((s == "납품취소").sum()) if len(s) else 0
 
-            left, m1, m2, m3, m4, m5 = st.columns([2, 1, 1, 1, 1, 1])
+            left, m1, m2, m3, m4, m5, m6, m7 = st.columns([1.7, 1, 1, 1, 1, 1, 1, 1])
             with left:
                 st.metric("오늘 접수(주문그룹)", int((orders["_date"] == today).sum()))
             with m1:
@@ -3139,26 +3426,43 @@ def main() -> None:
             with m2:
                 st.metric("납품예정", planned_cnt)
             with m3:
-                st.metric("납품완료", done_cnt)
+                st.metric("도면참조", custom_cnt)
             with m4:
-                st.metric("클레임", claim_cnt)
+                st.metric("납품완료", done_cnt)
             with m5:
+                st.metric("마감", closed_cnt)
+            with m6:
+                st.metric("클레임", claim_cnt)
+            with m7:
                 st.metric("납품취소", cancel_cnt)
 
             _sales_section_bar()
             st.subheader("오늘접수")
+            st.caption("**접수**와 **도면참조**(도면 주고 제작) 모두 이 패널에 포함됩니다.")
 
-            # Use 접수 상태만 집계/표시 (출고/클레임 등은 전체접수 목록에서 확인)
+            # 접수·도면참조만 일별 패널에 표시 (그 외는 접수목록에서 확인)
             recent_base = orders.copy()
             if "status" in recent_base.columns:
-                recent_base = recent_base[recent_base["status"] == "접수"]
+                recent_base = recent_base[recent_base["status"].isin(["접수", "도면참조"])]
 
             def _day_panel(col, day: dt.date) -> None:
                 df = recent_base[recent_base["_date"] == day].copy()
                 n_actual = len(df)
                 # Show request/attention icons in the "today" panels too
                 keep = [
-                    c for c in ["purchase_date", "receiver_name", "attention_note", "order_list", "status"] if c in df.columns
+                    c
+                    for c in [
+                        "purchase_date",
+                        "receiver_name",
+                        "attention_note",
+                        "special_issue",
+                        "order_list",
+                        "status",
+                        "order_id",
+                        "delivery_request",
+                        "deadline_raw",
+                    ]
+                    if c in df.columns
                 ]
                 df = df[keep]
                 if "purchase_date" not in df.columns:
@@ -3167,15 +3471,26 @@ def main() -> None:
                     df["receiver_name"] = ""
                 if "attention_note" not in df.columns:
                     df["attention_note"] = ""
+                if "special_issue" not in df.columns:
+                    df["special_issue"] = ""
                 if "order_list" not in df.columns:
                     df["order_list"] = ""
                 if "status" not in df.columns:
                     df["status"] = ""
+                if "order_id" not in df.columns:
+                    df["order_id"] = ""
+                if "delivery_request" not in df.columns:
+                    df["delivery_request"] = ""
+                if "deadline_raw" not in df.columns:
+                    df["deadline_raw"] = ""
 
                 def _disp_name(r: pd.Series) -> str:
                     nm = "" if r.get("receiver_name") is None else str(r.get("receiver_name")).strip()
                     stt = "" if r.get("status") is None else str(r.get("status")).strip()
-                    return _compact_name_display(stt, nm, r.get("attention_note"))
+                    att_src = _combined_attention_for_icons(r.get("attention_note"), r.get("special_issue"))
+                    return _compact_name_display(
+                        stt, nm, att_src, sheet_blob=_drawing_ref_sheet_blob(r, items_all)
+                    )
 
                 df["_이름표시"] = df.apply(_disp_name, axis=1)
                 df = df.rename(columns={"purchase_date": "날짜"})
@@ -3234,32 +3549,60 @@ def main() -> None:
                     df = ship_base.iloc[:0].copy()
                 n_ship = len(df)
                 keep = [
-                    c for c in ["shipped_at", "receiver_name", "attention_note", "order_list", "status"] if c in df.columns
+                    c
+                    for c in [
+                        "shipped_at",
+                        "receiver_name",
+                        "attention_note",
+                        "special_issue",
+                        "order_list",
+                        "status",
+                        "order_id",
+                        "delivery_request",
+                        "deadline_raw",
+                        "address",
+                    ]
+                    if c in df.columns
                 ]
                 df = df[keep] if len(keep) else pd.DataFrame()
                 if "shipped_at" not in df.columns:
                     df["shipped_at"] = pd.NaT
                 if "receiver_name" not in df.columns:
                     df["receiver_name"] = ""
+                if "address" not in df.columns:
+                    df["address"] = ""
                 if "attention_note" not in df.columns:
                     df["attention_note"] = ""
+                if "special_issue" not in df.columns:
+                    df["special_issue"] = ""
                 if "order_list" not in df.columns:
                     df["order_list"] = ""
                 if "status" not in df.columns:
                     df["status"] = ""
+                if "order_id" not in df.columns:
+                    df["order_id"] = ""
+                if "delivery_request" not in df.columns:
+                    df["delivery_request"] = ""
+                if "deadline_raw" not in df.columns:
+                    df["deadline_raw"] = ""
 
                 def _disp_ship_name(r: pd.Series) -> str:
                     nm = "" if r.get("receiver_name") is None else str(r.get("receiver_name")).strip()
                     stt = "" if r.get("status") is None else str(r.get("status")).strip()
                     att_c = _strip_order_list_overlap(r.get("attention_note"), r.get("order_list"))
-                    return _compact_name_display(stt, nm, att_c or None)
+                    att_src = _combined_attention_for_icons(att_c or None, r.get("special_issue"))
+                    return _compact_name_display(
+                        stt, nm, att_src, sheet_blob=_drawing_ref_sheet_blob(r, items_all)
+                    )
 
                 df["_이름표시"] = df.apply(_disp_ship_name, axis=1)
                 ts = pd.to_datetime(df["shipped_at"], errors="coerce")
                 df["_출고일시"] = ts.dt.strftime("%Y-%m-%d %H:%M").fillna("")
+                df["_주소"] = df["address"].astype(str).fillna("").map(lambda x: x.strip().replace("\n", " "))
+                df["_주소"] = df["_주소"].map(lambda x: (x[:32] + "…") if len(x) > 33 else x)
                 df = (
-                    df[["_출고일시", "_이름표시"]]
-                    .rename(columns={"_출고일시": "출고", "_이름표시": "이름"})
+                    df[["_출고일시", "_이름표시", "_주소"]]
+                    .rename(columns={"_출고일시": "출고", "_이름표시": "이름", "_주소": "주소"})
                     .sort_values(["이름"], na_position="last")
                 )
                 h_sd, h_sq = col.columns([5, 2])
@@ -3286,6 +3629,7 @@ def main() -> None:
                     column_config={
                         "출고": st.column_config.TextColumn("출고", width="small"),
                         "이름": st.column_config.TextColumn("이름", width="medium"),
+                        "주소": st.column_config.TextColumn("주소", width="large"),
                     },
                 )
 
@@ -3315,7 +3659,8 @@ def main() -> None:
                     st.subheader("출고시각 없음(보정 필요)")
                     st.dataframe(miss[cols_m].head(60), use_container_width=True, hide_index=True, height=240)
 
-    with tab_sales_period:
+    else:
+        # page3: 마감
         render_sales_period_tab(orders_all, items_all)
 
     # Mirror "name search" behavior: show selected rows in sidebar
@@ -3334,14 +3679,20 @@ def main() -> None:
     selected_ids_persisted = st.session_state.get("selected_ids_from_table", [])
 
     if selected_ids_persisted and st.session_state.get("active_selector") == "table":
-        picked = sorted_orders[sorted_orders["order_id"].isin(selected_ids_persisted)].copy()
+        # order_id dtype가 섞여도(숫자/문자) 선택 매칭이 되도록 문자열로 통일
+        idset = {str(x) for x in (selected_ids_persisted or []) if str(x)}
+        # 사이드바 상세는 화면 필터에 영향받지 않게 "전체 주문"에서 가져온다.
+        if "order_id" in orders_all.columns and idset:
+            picked = orders_all[orders_all["order_id"].astype(str).isin(list(idset))].copy()
+        else:
+            picked = orders_all.iloc[:0].copy()
         sort_cols_pick = [c for c in ["purchase_date", "receiver_name"] if c in picked.columns]
         if sort_cols_pick:
             picked = picked.sort_values(sort_cols_pick, na_position="last")
         st.sidebar.subheader("접수목록 선택 상세")
         st.sidebar.caption(f"선택: {len(selected_ids_persisted)}건")
         for _, r in picked.iterrows():
-            _render_order_detail(st.sidebar, r, items)
+            _render_order_detail(st.sidebar, r, items_all)
             st.sidebar.divider()
 
     # Claim details / special notes editor (applies to current selection)
@@ -3424,6 +3775,18 @@ def main() -> None:
 
     if back_tbl and st.session_state.get("active_selector") == "table":
         if selected_ids_persisted:
+            if "order_id" in orders_all.columns:
+                sub0 = orders_all[orders_all["order_id"].astype(str).isin([str(x) for x in selected_ids_persisted])].copy()
+            else:
+                sub0 = pd.DataFrame()
+            need_warn, wmsg = _revert_to_received_warn_message(sub0)
+            if need_warn:
+                st.session_state[MUTOMO_PENDING_REVERT_KEY] = {
+                    "order_ids": [str(x) for x in selected_ids_persisted],
+                    "source": "table",
+                    "message": wmsg,
+                }
+                st.rerun()
             con = sqlite3.connect(db_path)
             try:
                 cur = con.cursor()
@@ -3434,7 +3797,7 @@ def main() -> None:
                 con.commit()
             finally:
                 con.close()
-            st.sidebar.success(f"출고 취소(접수로 변경 + 출고시간 초기화): {len(selected_ids_persisted)}건")
+            st.sidebar.success(f"접수로 변경했습니다. (출고/마감 초기화): {len(selected_ids_persisted)}건")
             st.cache_data.clear()
             st.rerun()
 
@@ -3466,7 +3829,10 @@ def main() -> None:
                 con.commit()
             finally:
                 con.close()
-            st.sidebar.success(f"납품취소 처리: {len(selected_ids_persisted)}건")
+            st.sidebar.success(
+                f"납품취소 처리: {len(selected_ids_persisted)}건. "
+                "목록에서 안 보이면 **설정 → 상태 필터**에 **납품취소**가 포함돼 있는지 확인하세요."
+            )
             st.cache_data.clear()
             st.rerun()
 

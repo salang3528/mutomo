@@ -40,6 +40,17 @@ COLOR_WORDS = [
     # 원단/시트 상품명 (규격 열은 cm만 있고 색 열에만 적히는 경우)
     "올드블루진스",
     "런던브릭",
+    # 원단/컬러 추가 (실제 주문서에서 다리/옵션 칸에만 들어오는 케이스 보정)
+    "카멜리아",
+    "소프트세이지",
+    "옥스포드옐로우",
+    "세이지",
+    "무슬린",
+    "소프트퍼플",
+    "윈터선샤인",
+    "다크네이비",
+    "클래식블루",
+    "로즈로코코",
 ]
 
 
@@ -184,6 +195,21 @@ def _shelf_color_fallback_from_leg_cell(leg_cell: str | None) -> str | None:
     if re.search(r"다리", t):
         return None
     return _first_color(t)
+
+
+def shelf_color_from_note_raw_cell(raw: object) -> str | None:
+    """DB `note_raw`(엑셀 다리색 열 원본)만 보고 책장색 보정 — 인제스트·대시보드가 동일 규칙을 쓰게 한다."""
+    if raw is None:
+        return None
+    try:
+        if pd.isna(raw):
+            return None
+    except Exception:
+        pass
+    s = str(raw).strip()
+    if not s or s.lower() in ("none", "nan", "-", "#n/a"):
+        return None
+    return _shelf_color_fallback_from_leg_cell(s)
 
 
 def extract_leg_color(text: str | None) -> str | None:
@@ -594,6 +620,63 @@ def infer_settlement_ship_series(items_df: pd.DataFrame) -> pd.Series:
     return out
 
 
+def _as_text_blob(v: object) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    s = str(v)
+    if s.strip().lower() in ("nan", "none", "-", "#n/a"):
+        return ""
+    return s
+
+
+def _sheet_text_blob_for_order(order_row: pd.Series, items_df: pd.DataFrame) -> str:
+    """주문 1건 + 해당 품목 줄 전체에서 '도면참조' 검색용 텍스트."""
+    oid = str(order_row.get("order_id") or "").strip()
+    parts: list[str] = []
+    for key in ("receiver_name", "delivery_request", "attention_note", "order_list", "special_issue", "deadline_raw"):
+        if key in order_row.index:
+            parts.append(_as_text_blob(order_row.get(key)))
+    if oid and len(items_df) and "order_id" in items_df.columns:
+        sub = items_df.loc[items_df["order_id"].astype(str) == oid]
+        for _, ir in sub.iterrows():
+            for key in ("product_raw", "spec_raw", "note_raw", "ship_raw", "product_canonical"):
+                if key in ir.index:
+                    parts.append(_as_text_blob(ir.get(key)))
+    return "\n".join(parts)
+
+
+def order_sheet_blob_for_drawing_ref(order_row: pd.Series, items_df: pd.DataFrame) -> str:
+    """대시보드 이름 옆 📐 표시와 `apply_drawing_ref_status_from_sheet`와 동일한 본문 범위."""
+    return _sheet_text_blob_for_order(order_row, items_df)
+
+
+def sheet_contains_drawing_ref_keyword(text: str) -> bool:
+    """엑셀·현장에서 '도면참조'와 '도면참고'(참고)를 같은 의도로 쓰는 경우가 많음."""
+    if not text:
+        return False
+    compact = re.sub(r"[\s\u00a0]+", "", text)
+    return "도면참조" in compact or "도면참고" in compact
+
+
+def apply_drawing_ref_status_from_sheet(orders_df: pd.DataFrame, items_df: pd.DataFrame) -> pd.DataFrame:
+    """엑셀에서 온 본문에 '도면참조'가 있으면 status를 도면참조로(접수에서만 승격)."""
+    if orders_df is None or len(orders_df) == 0 or "status" not in orders_df.columns:
+        return orders_df
+    out = orders_df.copy()
+    st = out["status"].astype(str).str.strip()
+    hit: list[bool] = []
+    for _, row in out.iterrows():
+        hit.append(sheet_contains_drawing_ref_keyword(_sheet_text_blob_for_order(row, items_df)))
+    m = pd.Series(hit, index=out.index).fillna(False) & st.eq("접수")
+    out.loc[m, "status"] = "도면참조"
+    return out
+
+
 def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     alias_to_canon, canonicals = load_alias_map(alias_path)
     order_rows: dict[str, dict[str, Any]] = {}
@@ -717,6 +800,9 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
             orders_df = orders_df.drop(columns=["order_list"])
         orders_df = orders_df.merge(summary, on="order_id", how="left").rename(columns={"_line": "order_list"})
 
+    if len(orders_df):
+        orders_df = apply_drawing_ref_status_from_sheet(orders_df, items_df)
+
     # Write unknown product report as a side effect (easy for user to update aliases)
     if unknown_products:
         unk = (
@@ -793,11 +879,30 @@ ORDER_EDITABLE_COLS = {
     "closed_at",
 }
 
+# 재수집 시 엑셀 파싱 기본값이 아닌, DB·대시보드에 이미 쌓인 값을 우선한다.
+ORDER_USER_PRESERVED_COLS: frozenset[str] = frozenset(
+    {"status", "shipped_at", "closed_at", "special_issue"},
+)
+
+
+def _merge_cell_meaningful(v: object) -> bool:
+    if v is None:
+        return False
+    try:
+        if pd.isna(v):
+            return False
+    except Exception:
+        pass
+    if isinstance(v, str) and not v.strip():
+        return False
+    return True
+
 
 def _merge_orders_preserving_edits(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
     """
-    Keep user-entered fields from existing orders when present.
-    Overwrite the "parsed" fields from incoming.
+    incoming(새 파싱)을 베이스로 하되, 기존 주문에 대해서는
+    - 워크플로·수기 필드(status, shipped_at, closed_at, special_issue)는 DB 값이 있으면 유지
+    - 연락·목록 등은 새 값이 비어 있을 때만 기존으로 보완
     """
     if existing is None or len(existing) == 0:
         return incoming
@@ -814,11 +919,24 @@ def _merge_orders_preserving_edits(existing: pd.DataFrame, incoming: pd.DataFram
         if col not in inc.columns:
             inc[col] = None
 
-    # Start from incoming, then fill editable cols from existing when existing has a value
     merged = inc.copy()
     for col in ORDER_EDITABLE_COLS:
-        if col in ex.columns:
-            merged[col] = merged[col].where(merged[col].notna(), ex[col])
+        if col not in ex.columns:
+            continue
+        if col in ORDER_USER_PRESERVED_COLS:
+            if col == "status":
+                # 기본은 DB 값 우선이나, 엑셀에서 '도면참조'가 잡히면 기존 **접수**만 신규 값으로 승격
+                take_ex = ex[col].map(_merge_cell_meaningful).reindex(merged.index).fillna(False)
+                exs = ex[col].astype(str).str.strip().reindex(merged.index).fillna("")
+                incs = merged[col].astype(str).str.strip()
+                upgrade = take_ex & exs.eq("접수") & incs.eq("도면참조")
+                merged[col] = merged[col].where(~take_ex | upgrade, ex[col].reindex(merged.index))
+            else:
+                take_ex = ex[col].map(_merge_cell_meaningful).fillna(False)
+                merged[col] = ex[col].where(take_ex, merged[col])
+        else:
+            take_inc = merged[col].map(_merge_cell_meaningful).fillna(False)
+            merged[col] = merged[col].where(take_inc, ex[col])
 
     # Also keep created_at if it already existed (so "오늘 접수" 기준이 안정적)
     if "created_at" in ex.columns:
@@ -864,6 +982,70 @@ def iter_xlsx_files(input_dir: str) -> list[str]:
     return sorted(out)
 
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def run_ingest(
+    db_path: str,
+    *,
+    input_dir: str = "order_list",
+    aliases_path: str = "product_aliases.yml",
+) -> tuple[bool, str]:
+    """`order_list` 등의 .xlsx를 읽어 SQLite에 반영. cwd와 무관하게 이 저장소 폴더(스크립트 위치)를 기준으로 한다.
+
+    대시보드에서 호출할 때 터미널 ingest와 동일한 결과를 내도록 한다.
+    """
+    root = _SCRIPT_DIR
+
+    def _to_abs(p: str) -> str:
+        p = (p or "").strip()
+        if not p:
+            return ""
+        return os.path.normpath(p if os.path.isabs(p) else os.path.join(root, p))
+
+    inp = _to_abs(input_dir) or os.path.join(root, "order_list")
+    db_abs = _to_abs(db_path) or os.path.join(root, "mutomo.sqlite")
+    ali = _to_abs(aliases_path) or os.path.join(root, "product_aliases.yml")
+
+    if not os.path.isdir(inp):
+        default_order_list = os.path.normpath(os.path.join(root, "order_list"))
+        if os.path.normpath(inp) == default_order_list:
+            try:
+                os.makedirs(inp, exist_ok=True)
+            except OSError as e:
+                return False, f"order_list 폴더를 만들 수 없습니다: {e}"
+        else:
+            return False, f"입력 폴더가 없습니다: `{inp}`"
+
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+        paths = iter_xlsx_files(inp)
+        if not paths:
+            orders_df, items_df = build_frames([], ali)
+            write_sqlite(db_abs, orders_df, items_df)
+            return (
+                True,
+                f"xlsx 없음 — 빈 orders/items 반영: 주문 {len(orders_df)}건 (`{inp}` → `{db_abs}`)",
+            )
+        all_rows: list[ItemRow] = []
+        for p in paths:
+            all_rows.extend(_parse_excel(p))
+        orders_df, items_df = build_frames(all_rows, ali)
+        write_sqlite(db_abs, orders_df, items_df)
+        extra = ""
+        if os.path.isfile(os.path.join(root, "unknown_products.csv")):
+            extra = " (unknown_products.csv 갱신)"
+        return True, f"수집 완료: xlsx {len(paths)}개 → 주문 {len(orders_df)}건, 품목 {len(items_df)}줄{extra}"
+    except Exception as e:
+        return False, f"수집 실패: {e!s}"
+    finally:
+        try:
+            os.chdir(old_cwd)
+        except Exception:
+            pass
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -875,33 +1057,11 @@ def main() -> None:
     ap.add_argument("--db", default="mutomo.sqlite", help="output sqlite database path")
     args = ap.parse_args()
 
-    input_dir = os.path.normpath(args.input_dir)
-    if not os.path.isdir(input_dir):
-        if input_dir == os.path.normpath("order_list"):
-            os.makedirs(input_dir, exist_ok=True)
-        else:
-            raise SystemExit(
-                "입력 폴더가 없습니다: "
-                + input_dir
-                + "\n경로를 확인하거나, order_list 폴더를 만든 뒤 .xlsx를 넣으세요."
-            )
-
-    paths = iter_xlsx_files(input_dir)
-    if not paths:
-        print(f"No .xlsx files found in: {input_dir} - writing empty orders/items tables.")
-        orders_df, items_df = build_frames([], args.aliases)
-        write_sqlite(args.db, orders_df, items_df)
-        print(f"Wrote {len(orders_df)} orders and {len(items_df)} items to {args.db}")
-        return
-
-    all_rows: list[ItemRow] = []
-    for p in paths:
-        all_rows.extend(_parse_excel(p))
-
-    orders_df, items_df = build_frames(all_rows, args.aliases)
-    write_sqlite(args.db, orders_df, items_df)
-    print(f"Wrote {len(orders_df)} orders and {len(items_df)} items to {args.db}")
-    if os.path.exists("unknown_products.csv"):
+    ok, msg = run_ingest(args.db, input_dir=args.input_dir, aliases_path=args.aliases)
+    print(msg)
+    if not ok:
+        raise SystemExit(msg)
+    if os.path.exists(os.path.join(_SCRIPT_DIR, "unknown_products.csv")):
         print("Also wrote unknown product keys to unknown_products.csv")
 
 

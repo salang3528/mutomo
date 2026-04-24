@@ -47,7 +47,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Backup mutomo sqlite DB safely.")
     p.add_argument("--db", default="mutomo.sqlite", help="Path to sqlite DB file")
     p.add_argument("--out", default="backups", help="Backup directory")
-    p.add_argument("--keep-days", type=int, default=30, help="Retention days")
+    p.add_argument("--keep-days", type=int, default=30, help="보관 일수(기본 약 한 달, 초과 백업 파일 삭제)")
     args = p.parse_args()
 
     out = backup_sqlite(args.db, args.out, args.keep_days)
