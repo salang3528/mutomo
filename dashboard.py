@@ -1633,6 +1633,68 @@ def _build_shipped_excel_bytes(orders_all: pd.DataFrame, items_all: pd.DataFrame
     return buf.getvalue()
 
 
+def _build_lozen_xlsx_bytes_for_orders(
+    orders_all: pd.DataFrame,
+    items_all: pd.DataFrame,
+    order_ids: list[str],
+) -> bytes:
+    """선택된 주문들로 '로젠택배' 업로드용 단일 시트 엑셀을 만든다."""
+    cols = [
+        "수하인명",
+        "수하인주소",
+        "수하인전화번호",
+        "수하인휴대폰번호",
+        "박스수량",
+        "택배운임",
+        "운임구분",
+        "품목명",
+        "배송메세지",
+    ]
+
+    if orders_all is None or len(orders_all) == 0 or not order_ids:
+        buf0 = io.BytesIO()
+        with pd.ExcelWriter(buf0, engine="openpyxl") as w:
+            pd.DataFrame(columns=cols).to_excel(w, index=False, sheet_name="로젠택배")
+        return buf0.getvalue()
+
+    sub = orders_all[orders_all["order_id"].astype(str).isin([str(x) for x in order_ids])].copy().reset_index(drop=True)
+
+    # 택배만 포함 (엑셀 배송란 추정)
+    if items_all is not None and len(items_all) and "order_id" in items_all.columns:
+        ship_series = infer_settlement_ship_series(items_all)
+        ship_kind = sub["order_id"].astype(str).map(ship_series).fillna("택배")
+        sub = sub[ship_kind.astype(str).isin(["택배"])].copy()
+
+    def _item_name(o: pd.Series) -> str:
+        ol = str(o.get("order_list") or "").strip().replace("\n", " / ")
+        if not ol:
+            return ""
+        return (ol[:50] + "…") if len(ol) > 51 else ol
+
+    lozen = pd.DataFrame(
+        [
+            {
+                "수하인명": o.get("receiver_name"),
+                "수하인주소": o.get("address"),
+                "수하인전화번호": o.get("phone"),
+                "수하인휴대폰번호": o.get("phone"),
+                "박스수량": 1,
+                "택배운임": 3000,
+                "운임구분": "선불",
+                "품목명": _item_name(o),
+                "배송메세지": o.get("delivery_request"),
+            }
+            for _, o in sub.iterrows()
+        ],
+        columns=cols,
+    )
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        lozen.to_excel(w, index=False, sheet_name="로젠택배")
+    return buf.getvalue()
+
+
 def update_special_issue_for_orders(db_path: str, order_ids: list[str], text: str) -> None:
     if not order_ids:
         return
@@ -2322,7 +2384,7 @@ def render_receiver_name_search(
         st.session_state["prev_search_pick_ids"] = pick_ids
 
     ship_action = st.button("선택 건 출고 처리", type="primary", key="ship_one_button")
-    rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+    rc1, rc2, rc3, rc4, rc5 = st.columns([1, 1, 1, 1, 1.4])
     with rc1:
         claim_action = st.button("클레임", key="status_claim")
     with rc2:
@@ -2333,6 +2395,15 @@ def render_receiver_name_search(
         close_action = st.button("마감", key="status_close")
     with rc5:
         cancel_action = st.button("납품취소", key="status_cancel")
+    with rc5:
+        st.download_button(
+            "로젠 업로드(.xlsx)",
+            data=_build_lozen_xlsx_bytes_for_orders(orders, items_all, pick_ids) if pick_ids else b"",
+            file_name=f"lozen_upload_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=not bool(pick_ids),
+            help="선택된 주문 중 택배(엑셀 기준)만 포함해 로젠 업로드용 엑셀을 만듭니다.",
+        )
 
     # 도면참조/도면참고 주문은 출고 시 금액(단가) 수기 입력을 지원한다.
     if "mutomo_pending_ship_with_price" not in st.session_state:
