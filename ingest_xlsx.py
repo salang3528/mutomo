@@ -15,7 +15,6 @@ import yaml
 from rapidfuzz import fuzz, process
 
 from recipient_identity import assign_recipient_ids
-from openpyxl.utils.datetime import from_excel as _excel_serial_to_datetime
 
 
 EXPECTED_COLS = 13  # current vendor sheet has 13 columns (incl. address/phone/request)
@@ -40,17 +39,6 @@ COLOR_WORDS = [
     # 원단/시트 상품명 (규격 열은 cm만 있고 색 열에만 적히는 경우)
     "올드블루진스",
     "런던브릭",
-    # 원단/컬러 추가 (실제 주문서에서 다리/옵션 칸에만 들어오는 케이스 보정)
-    "카멜리아",
-    "소프트세이지",
-    "옥스포드옐로우",
-    "세이지",
-    "무슬린",
-    "소프트퍼플",
-    "윈터선샤인",
-    "다크네이비",
-    "클래식블루",
-    "로즈로코코",
 ]
 
 
@@ -93,76 +81,6 @@ def purchase_date_from_filename(source_file: str) -> str | None:
         return None
 
 
-def parse_purchase_date_from_sheet(raw: object, source_file: str | None = None) -> str | None:
-    """
-    엑셀의 '주문일자' 셀 값을 ISO 날짜(YYYY-MM-DD)로 변환합니다.
-    파일명(YYMMDD)보다 우선해서 접수일자를 날짜별로 정확히 구분하기 위함입니다.
-    """
-    if raw is None:
-        return None
-    if isinstance(raw, dt.datetime):
-        try:
-            return raw.date().isoformat()
-        except Exception:
-            return None
-    if isinstance(raw, dt.date):
-        return raw.isoformat()
-
-    s = str(raw).strip()
-    if not s or s.lower() in ("none", "nan", "-", "#n/a"):
-        return None
-
-    # "2026-04-16 00:00:00" / "2026-04-16"
-    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
-        try:
-            return dt.date.fromisoformat(s[:10]).isoformat()
-        except ValueError:
-            pass
-
-    # "4.19" / "4/19" 같은 형태 (대부분 주문서에서 사용하는 월.일)
-    m = re.fullmatch(r"(?P<m>\d{1,2})\s*[./-]\s*(?P<d>\d{1,2})", s)
-    if m:
-        mm = int(m.group("m"))
-        dd = int(m.group("d"))
-        # 연도는 파일명 YYMMDD에서 추정. (없으면 올해)
-        base_iso = purchase_date_from_filename(source_file or "") if source_file else None
-        base = None
-        try:
-            base = dt.date.fromisoformat(base_iso) if base_iso else None
-        except Exception:
-            base = None
-        yyyy = (base.year if base else dt.date.today().year)
-        # 12월 주문이 4월 파일에 섞이는 케이스 등: base 월보다 크게 멀면 작년으로 간주
-        if base and (mm - base.month) >= 6:
-            yyyy = base.year - 1
-        try:
-            return dt.date(yyyy, mm, dd).isoformat()
-        except Exception:
-            return None
-
-    ts = pd.to_datetime(s, errors="coerce", dayfirst=False)
-    if not pd.isna(ts):
-        try:
-            return ts.date().isoformat()
-        except Exception:
-            pass
-
-    # 숫자만(엑셀 날짜 직렬값) — openpyxl data_only 시 datetime이 아닌 경우
-    if re.fullmatch(r"\d{5,6}", s):
-        try:
-            n = float(s)
-            if 30000 <= n <= 80000:
-                d = _excel_serial_to_datetime(n)
-                if isinstance(d, dt.datetime):
-                    return d.date().isoformat()
-                if isinstance(d, dt.date):
-                    return d.isoformat()
-        except Exception:
-            pass
-
-    return None
-
-
 def extract_size(text: str | None) -> str | None:
     if not text:
         return None
@@ -195,21 +113,6 @@ def _shelf_color_fallback_from_leg_cell(leg_cell: str | None) -> str | None:
     if re.search(r"다리", t):
         return None
     return _first_color(t)
-
-
-def shelf_color_from_note_raw_cell(raw: object) -> str | None:
-    """DB `note_raw`(엑셀 다리색 열 원본)만 보고 책장색 보정 — 인제스트·대시보드가 동일 규칙을 쓰게 한다."""
-    if raw is None:
-        return None
-    try:
-        if pd.isna(raw):
-            return None
-    except Exception:
-        pass
-    s = str(raw).strip()
-    if not s or s.lower() in ("none", "nan", "-", "#n/a"):
-        return None
-    return _shelf_color_fallback_from_leg_cell(s)
 
 
 def extract_leg_color(text: str | None) -> str | None:
@@ -620,63 +523,6 @@ def infer_settlement_ship_series(items_df: pd.DataFrame) -> pd.Series:
     return out
 
 
-def _as_text_blob(v: object) -> str:
-    if v is None:
-        return ""
-    try:
-        if pd.isna(v):
-            return ""
-    except Exception:
-        pass
-    s = str(v)
-    if s.strip().lower() in ("nan", "none", "-", "#n/a"):
-        return ""
-    return s
-
-
-def _sheet_text_blob_for_order(order_row: pd.Series, items_df: pd.DataFrame) -> str:
-    """주문 1건 + 해당 품목 줄 전체에서 '도면참조' 검색용 텍스트."""
-    oid = str(order_row.get("order_id") or "").strip()
-    parts: list[str] = []
-    for key in ("receiver_name", "delivery_request", "attention_note", "order_list", "special_issue", "deadline_raw"):
-        if key in order_row.index:
-            parts.append(_as_text_blob(order_row.get(key)))
-    if oid and len(items_df) and "order_id" in items_df.columns:
-        sub = items_df.loc[items_df["order_id"].astype(str) == oid]
-        for _, ir in sub.iterrows():
-            for key in ("product_raw", "spec_raw", "note_raw", "ship_raw", "product_canonical"):
-                if key in ir.index:
-                    parts.append(_as_text_blob(ir.get(key)))
-    return "\n".join(parts)
-
-
-def order_sheet_blob_for_drawing_ref(order_row: pd.Series, items_df: pd.DataFrame) -> str:
-    """대시보드 이름 옆 📐 표시와 `apply_drawing_ref_status_from_sheet`와 동일한 본문 범위."""
-    return _sheet_text_blob_for_order(order_row, items_df)
-
-
-def sheet_contains_drawing_ref_keyword(text: str) -> bool:
-    """엑셀·현장에서 '도면참조'와 '도면참고'(참고)를 같은 의도로 쓰는 경우가 많음."""
-    if not text:
-        return False
-    compact = re.sub(r"[\s\u00a0]+", "", text)
-    return "도면참조" in compact or "도면참고" in compact
-
-
-def apply_drawing_ref_status_from_sheet(orders_df: pd.DataFrame, items_df: pd.DataFrame) -> pd.DataFrame:
-    """엑셀에서 온 본문에 '도면참조'가 있으면 status를 도면참조로(접수에서만 승격)."""
-    if orders_df is None or len(orders_df) == 0 or "status" not in orders_df.columns:
-        return orders_df
-    out = orders_df.copy()
-    st = out["status"].astype(str).str.strip()
-    hit: list[bool] = []
-    for _, row in out.iterrows():
-        hit.append(sheet_contains_drawing_ref_keyword(_sheet_text_blob_for_order(row, items_df)))
-    m = pd.Series(hit, index=out.index).fillna(False) & st.eq("접수")
-    out.loc[m, "status"] = "도면참조"
-    return out
-
-
 def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     alias_to_canon, canonicals = load_alias_map(alias_path)
     order_rows: dict[str, dict[str, Any]] = {}
@@ -688,7 +534,6 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
         start = it.group_start_row if it.group_start_row is not None else it.row_idx
         order_id = f"{it.source_file}#{it.group_no}@{start}"
         if order_id not in order_rows:
-            sheet_p = parse_purchase_date_from_sheet(it.order_date_raw, it.source_file)
             order_rows[order_id] = {
                 "order_id": order_id,
                 "source_file": it.source_file,
@@ -696,8 +541,8 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
                 "group_start_row": it.group_start_row,
                 "deadline_raw": it.deadline_raw,
                 "order_date_raw": it.order_date_raw,
-                # 구매일자: 엑셀 주문일자 우선, 없으면 파일명 YYMMDD (예: 260401-.. -> 2026-04-01)
-                "purchase_date": sheet_p or purchase_date_from_filename(it.source_file),
+                # 구매일자: 파일명에서 추출 (예: 260401-.. -> 2026-04-01)
+                "purchase_date": purchase_date_from_filename(it.source_file),
                 # 주문자(받는사람) / 배송 정보: 이 엑셀(3열, 11~13열)에서 추출
                 "receiver_name": it.receiver_name_raw,
                 "address": it.address_raw,
@@ -717,9 +562,6 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
         else:
             # Fill missing order-level fields if later rows contain them
             o = order_rows[order_id]
-            sheet_p = parse_purchase_date_from_sheet(it.order_date_raw, it.source_file)
-            if sheet_p:
-                o["purchase_date"] = sheet_p
             for k, v in [
                 ("receiver_name", it.receiver_name_raw),
                 ("address", it.address_raw),
@@ -800,9 +642,6 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
             orders_df = orders_df.drop(columns=["order_list"])
         orders_df = orders_df.merge(summary, on="order_id", how="left").rename(columns={"_line": "order_list"})
 
-    if len(orders_df):
-        orders_df = apply_drawing_ref_status_from_sheet(orders_df, items_df)
-
     # Write unknown product report as a side effect (easy for user to update aliases)
     if unknown_products:
         unk = (
@@ -867,6 +706,7 @@ def build_frames(rows: Iterable[ItemRow], alias_path: str) -> tuple[pd.DataFrame
 
 
 ORDER_EDITABLE_COLS = {
+    "purchase_date",
     "receiver_name",
     "address",
     "phone",
@@ -875,34 +715,13 @@ ORDER_EDITABLE_COLS = {
     "special_issue",
     "status",
     "shipped_at",
-    # 대시보드에서 기록하는 마감 시각 — 재수집 시 incoming에 없으므로 반드시 보존
-    "closed_at",
 }
-
-# 재수집 시 엑셀 파싱 기본값이 아닌, DB·대시보드에 이미 쌓인 값을 우선한다.
-ORDER_USER_PRESERVED_COLS: frozenset[str] = frozenset(
-    {"status", "shipped_at", "closed_at", "special_issue"},
-)
-
-
-def _merge_cell_meaningful(v: object) -> bool:
-    if v is None:
-        return False
-    try:
-        if pd.isna(v):
-            return False
-    except Exception:
-        pass
-    if isinstance(v, str) and not v.strip():
-        return False
-    return True
 
 
 def _merge_orders_preserving_edits(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
     """
-    incoming(새 파싱)을 베이스로 하되, 기존 주문에 대해서는
-    - 워크플로·수기 필드(status, shipped_at, closed_at, special_issue)는 DB 값이 있으면 유지
-    - 연락·목록 등은 새 값이 비어 있을 때만 기존으로 보완
+    Keep user-entered fields from existing orders when present.
+    Overwrite the "parsed" fields from incoming.
     """
     if existing is None or len(existing) == 0:
         return incoming
@@ -919,24 +738,11 @@ def _merge_orders_preserving_edits(existing: pd.DataFrame, incoming: pd.DataFram
         if col not in inc.columns:
             inc[col] = None
 
+    # Start from incoming, then fill editable cols from existing when existing has a value
     merged = inc.copy()
     for col in ORDER_EDITABLE_COLS:
-        if col not in ex.columns:
-            continue
-        if col in ORDER_USER_PRESERVED_COLS:
-            if col == "status":
-                # 기본은 DB 값 우선이나, 엑셀에서 '도면참조'가 잡히면 기존 **접수**만 신규 값으로 승격
-                take_ex = ex[col].map(_merge_cell_meaningful).reindex(merged.index).fillna(False)
-                exs = ex[col].astype(str).str.strip().reindex(merged.index).fillna("")
-                incs = merged[col].astype(str).str.strip()
-                upgrade = take_ex & exs.eq("접수") & incs.eq("도면참조")
-                merged[col] = merged[col].where(~take_ex | upgrade, ex[col].reindex(merged.index))
-            else:
-                take_ex = ex[col].map(_merge_cell_meaningful).fillna(False)
-                merged[col] = ex[col].where(take_ex, merged[col])
-        else:
-            take_inc = merged[col].map(_merge_cell_meaningful).fillna(False)
-            merged[col] = merged[col].where(take_inc, ex[col])
+        if col in ex.columns:
+            merged[col] = merged[col].where(merged[col].notna(), ex[col])
 
     # Also keep created_at if it already existed (so "오늘 접수" 기준이 안정적)
     if "created_at" in ex.columns:
@@ -982,70 +788,6 @@ def iter_xlsx_files(input_dir: str) -> list[str]:
     return sorted(out)
 
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def run_ingest(
-    db_path: str,
-    *,
-    input_dir: str = "order_list",
-    aliases_path: str = "product_aliases.yml",
-) -> tuple[bool, str]:
-    """`order_list` 등의 .xlsx를 읽어 SQLite에 반영. cwd와 무관하게 이 저장소 폴더(스크립트 위치)를 기준으로 한다.
-
-    대시보드에서 호출할 때 터미널 ingest와 동일한 결과를 내도록 한다.
-    """
-    root = _SCRIPT_DIR
-
-    def _to_abs(p: str) -> str:
-        p = (p or "").strip()
-        if not p:
-            return ""
-        return os.path.normpath(p if os.path.isabs(p) else os.path.join(root, p))
-
-    inp = _to_abs(input_dir) or os.path.join(root, "order_list")
-    db_abs = _to_abs(db_path) or os.path.join(root, "mutomo.sqlite")
-    ali = _to_abs(aliases_path) or os.path.join(root, "product_aliases.yml")
-
-    if not os.path.isdir(inp):
-        default_order_list = os.path.normpath(os.path.join(root, "order_list"))
-        if os.path.normpath(inp) == default_order_list:
-            try:
-                os.makedirs(inp, exist_ok=True)
-            except OSError as e:
-                return False, f"order_list 폴더를 만들 수 없습니다: {e}"
-        else:
-            return False, f"입력 폴더가 없습니다: `{inp}`"
-
-    old_cwd = os.getcwd()
-    try:
-        os.chdir(root)
-        paths = iter_xlsx_files(inp)
-        if not paths:
-            orders_df, items_df = build_frames([], ali)
-            write_sqlite(db_abs, orders_df, items_df)
-            return (
-                True,
-                f"xlsx 없음 — 빈 orders/items 반영: 주문 {len(orders_df)}건 (`{inp}` → `{db_abs}`)",
-            )
-        all_rows: list[ItemRow] = []
-        for p in paths:
-            all_rows.extend(_parse_excel(p))
-        orders_df, items_df = build_frames(all_rows, ali)
-        write_sqlite(db_abs, orders_df, items_df)
-        extra = ""
-        if os.path.isfile(os.path.join(root, "unknown_products.csv")):
-            extra = " (unknown_products.csv 갱신)"
-        return True, f"수집 완료: xlsx {len(paths)}개 → 주문 {len(orders_df)}건, 품목 {len(items_df)}줄{extra}"
-    except Exception as e:
-        return False, f"수집 실패: {e!s}"
-    finally:
-        try:
-            os.chdir(old_cwd)
-        except Exception:
-            pass
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -1057,11 +799,33 @@ def main() -> None:
     ap.add_argument("--db", default="mutomo.sqlite", help="output sqlite database path")
     args = ap.parse_args()
 
-    ok, msg = run_ingest(args.db, input_dir=args.input_dir, aliases_path=args.aliases)
-    print(msg)
-    if not ok:
-        raise SystemExit(msg)
-    if os.path.exists(os.path.join(_SCRIPT_DIR, "unknown_products.csv")):
+    input_dir = os.path.normpath(args.input_dir)
+    if not os.path.isdir(input_dir):
+        if input_dir == os.path.normpath("order_list"):
+            os.makedirs(input_dir, exist_ok=True)
+        else:
+            raise SystemExit(
+                "입력 폴더가 없습니다: "
+                + input_dir
+                + "\n경로를 확인하거나, order_list 폴더를 만든 뒤 .xlsx를 넣으세요."
+            )
+
+    paths = iter_xlsx_files(input_dir)
+    if not paths:
+        print(f"No .xlsx files found in: {input_dir} - writing empty orders/items tables.")
+        orders_df, items_df = build_frames([], args.aliases)
+        write_sqlite(args.db, orders_df, items_df)
+        print(f"Wrote {len(orders_df)} orders and {len(items_df)} items to {args.db}")
+        return
+
+    all_rows: list[ItemRow] = []
+    for p in paths:
+        all_rows.extend(_parse_excel(p))
+
+    orders_df, items_df = build_frames(all_rows, args.aliases)
+    write_sqlite(args.db, orders_df, items_df)
+    print(f"Wrote {len(orders_df)} orders and {len(items_df)} items to {args.db}")
+    if os.path.exists("unknown_products.csv"):
         print("Also wrote unknown product keys to unknown_products.csv")
 
 
