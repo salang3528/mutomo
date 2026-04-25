@@ -1914,7 +1914,7 @@ def render_receiver_name_search(
     else:
         hits_live = orders.iloc[:0].copy()
 
-    st.markdown("**선택 요약**")
+    # 선택 요약/경고/힌트는 화면 상단을 크게 차지하므로 기본은 접어서 보여준다.
     pick_ids = []
     seen_oid: set[str] = set()
     for i in range(len(terms_rows)):
@@ -1932,26 +1932,28 @@ def render_receiver_name_search(
                 pick_ids.append(oid)
 
     n_sum = len(pick_ids)
-    st.caption(f"**{n_sum}건**")
+    st.caption(f"선택: **{n_sum}건**")
 
+    _hint_lines = _identity_hint_lines(hits_live) if len(hits_live) else []
     _already_done_status = frozenset({"출고", "마감", "납품취소"})
+    _done_warn = ""
     if pick_ids and "status" in orders.columns and "order_id" in orders.columns:
         _sp = orders[orders["order_id"].astype(str).isin([str(x) for x in pick_ids])]
         if len(_sp):
             _st = _sp["status"].astype(str).str.strip()
             _n_done = int(_st.isin(_already_done_status).sum())
             if _n_done:
-                st.warning(
+                _done_warn = (
                     f"선택 **{n_sum}건** 중 **{_n_done}건**은 이미 처리된 주문입니다 "
                     f"(출고·마감·납품취소). **출고** 버튼은 출고 완료 건을 건너뜁니다."
                 )
 
-    if len(hits_live) == 0:
-        pass
-
-    _hint_lines = _identity_hint_lines(hits_live)
-    if _hint_lines and len(hits_live):
-        st.info("\n\n".join(_hint_lines))
+    if _done_warn or _hint_lines:
+        with st.expander("선택 요약/힌트", expanded=False):
+            if _done_warn:
+                st.warning(_done_warn)
+            if _hint_lines:
+                st.info("\n\n".join(_hint_lines))
 
     st.session_state["search_pick_ids"] = pick_ids
 
@@ -2758,6 +2760,62 @@ def main() -> None:
             picked = picked.sort_values(sort_cols_pick, na_position="last")
         st.sidebar.subheader("접수목록 선택 상세")
         st.sidebar.caption(f"선택: {len(selected_ids_persisted)}건")
+
+        # 빠른 처리: 메인 표 상단 버튼(접수/출고/마감)과 동일 기능을 사이드바에도 제공
+        sb1, sb2, sb3 = st.sidebar.columns(3)
+        with sb1:
+            _sb_ship = st.button("출고", type="primary", key="sidebar_table_ship_btn")
+        with sb2:
+            _sb_back = st.button("접수", key="sidebar_table_received_btn")
+        with sb3:
+            _sb_close = st.button("마감", key="sidebar_table_close_btn")
+
+        if _sb_ship:
+            con = sqlite3.connect(db_path)
+            try:
+                cur = con.cursor()
+                now = dt.datetime.now().isoformat(timespec="seconds")
+                cur.executemany(
+                    "UPDATE orders SET status=?, shipped_at=COALESCE(shipped_at, ?) WHERE order_id=?",
+                    [("출고", now, oid) for oid in selected_ids_persisted],
+                )
+                con.commit()
+            finally:
+                con.close()
+            st.sidebar.success(f"출고 처리: {len(selected_ids_persisted)}건")
+            st.cache_data.clear()
+            st.rerun()
+
+        if _sb_back:
+            con = sqlite3.connect(db_path)
+            try:
+                cur = con.cursor()
+                cur.executemany(
+                    "UPDATE orders SET status=?, shipped_at=NULL WHERE order_id=?",
+                    [("접수", oid) for oid in selected_ids_persisted],
+                )
+                con.commit()
+            finally:
+                con.close()
+            st.sidebar.success(f"접수로 변경(출고시간 초기화): {len(selected_ids_persisted)}건")
+            st.cache_data.clear()
+            st.rerun()
+
+        if _sb_close:
+            con = sqlite3.connect(db_path)
+            try:
+                cur = con.cursor()
+                cur.executemany(
+                    "UPDATE orders SET status=? WHERE order_id=?",
+                    [("마감", oid) for oid in selected_ids_persisted],
+                )
+                con.commit()
+            finally:
+                con.close()
+            st.sidebar.success(f"마감 처리: {len(selected_ids_persisted)}건")
+            st.cache_data.clear()
+            st.rerun()
+
         for _, r in picked.iterrows():
             _render_order_detail(st.sidebar, r, items)
             st.sidebar.divider()
